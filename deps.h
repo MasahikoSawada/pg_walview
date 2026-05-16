@@ -1,0 +1,5 @@
+#include "c.h"
+#include "postgres.h"
+#include "pg_config.h"
+#include "access/xlog_internal.h"
+#include "access/heapam_xlog.h"
