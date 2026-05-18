@@ -1,6 +1,6 @@
-Output demo.gif
+Output assets/demo.gif
 
-Set FontSize 11
+Set FontSize 12
 Set Width 1200
 Set Height 600
 
