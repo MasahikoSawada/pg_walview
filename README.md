@@ -2,7 +2,7 @@
 
 > A modernized, interactive TUI alternative to `pg_waldump` for exploring PostgreSQL Write-Ahead Logs.
 
-![pg_walview screenshot](./assets/screenshot.png)
+![pg_walview screenshot](./assets/demo.gif)
 
 Tired of parsing endless lines of `pg_waldump` static text output? 
 `pg_walview` brings PostgreSQL Write-Ahead Log (WAL) analysis into the modern era. It is a blazing fast, terminal-based user interface (TUI) tool designed for DBAs, PostgreSQL core developers, and internals enthusiasts to seamlessly explore, filter, and drill down into WAL records.
