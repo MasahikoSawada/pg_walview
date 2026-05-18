@@ -10,13 +10,12 @@ A modernized, interactive TUI alternative to `pg_waldump` for exploring PostgreS
 - Deep Drill-down: Detail split view. Inspect `XLogRecord` details, block-level information (`RelFileNode`), and Full Page Images (FPI) instantly.
 
 ### Build from source
+
 ```bash
-git clone [https://github.com/your-username/pg_walview.git](https://github.com/your-username/pg_walview.git)
+git clone https://github.com/MasahikoSawada/pg_walview.git
 cd pg_walview
-```
 
 # Standard build (relies on `pg_config` in your PATH)
-```bash
 cargo build --release
 
 # If you have a custom PostgreSQL installation, specify the include path:
