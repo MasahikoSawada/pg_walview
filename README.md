@@ -46,3 +46,6 @@ pg_walview /path/to/pg_wal/000000010000000000000001
 | `q`                  | Quit the application               |
 
 
+# License
+
+pg_walview is released under the [MIT License](LICENSE). PostgreSQL header files included via `bindgen` at build time are covered by the [PostgreSQL License](https://www.postgresql.org/about/licence/).
