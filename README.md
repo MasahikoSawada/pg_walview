@@ -32,13 +32,17 @@ pg_walview /path/to/pg_wal/000000010000000000000001
 
 # Keybindings
 
-| Key                  | Action                              |
-|----------------------|-------------------------------------|
-| `j` / `↓`           | Move selection down (Next record)   |
-| `k` / `↑`           | Move selection up (Previous record) |
+| Key        | Action                                    |
+|------------|-------------------------------------------|
+| `j` / `↓` | Move selection down (Next record)         |
+| `k` / `↑` | Move selection up (Previous record)       |
+| `g`        | Jump to the first record                  |
+| `G`        | Jump to the last record                   |
+| `s`        | Jump to next record with the same XID     |
+| `r`        | Jump to previous record with the same XID |
 | `Space` / `PageDown` | Jump forward (Page Down)            |
 | `-` / `PageUp`       | Jump backward (Page Up)             |
 | `Tab`                | Switch Pane                         |
-| `q`                  | Quite the application               |
+| `q`                  | Quit the application               |
 
 

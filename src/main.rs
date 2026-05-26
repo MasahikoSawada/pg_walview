@@ -224,6 +224,8 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.move_record_down(),
 	    KeyCode::Char('g') => self.move_top(),
 	    KeyCode::Char('G') => self.move_bottom(),
+	    KeyCode::Char('s') => self.move_next_record(),
+	    KeyCode::Char('r') => self.move_prev_record(),
             KeyCode::PageUp | KeyCode::Char('-') => self.page_up(),
             KeyCode::PageDown | KeyCode::Char(' ') => self.page_down(),
             _ => {}
@@ -257,6 +259,44 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn move_next_record(&mut self) {
+	let Some(idx) = self.state.selected() else {
+	    return;
+	};
+
+        let selected_xid: TransactionId = self.records[idx].xlrec.xl_xid;
+	if selected_xid < 3 {
+	    return;
+	}
+
+	for i in (idx + 1)..self.records.len() {
+	    if self.records[i].xlrec.xl_xid == selected_xid {
+		self.state.select(Some(i));
+		self.on_record_change();
+		return;
+	    }
+	}
+    }
+
+    fn move_prev_record(&mut self) {
+	let Some(idx) = self.state.selected() else {
+	    return;
+	};
+
+        let selected_xid: TransactionId = self.records[idx].xlrec.xl_xid;
+	if selected_xid < 3 {
+	    return;
+	}
+
+	for i in (0..idx).rev() {
+	    if self.records[i].xlrec.xl_xid == selected_xid {
+		self.state.select(Some(i));
+		self.on_record_change();
+		return;
+	    }
+	}
     }
 
     fn move_record_down(&mut self) {
