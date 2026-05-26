@@ -22,6 +22,8 @@ cargo build --release
 PG_INCLUDE_DIR=/path/to/pgsql/include/server cargo build --release
 ```
 
+Note that pg_walview currently supports only PostgreSQL 18.
+
 # Usage
 
 Simply pass the path to a PostgreSQL WAL file as an argument:
