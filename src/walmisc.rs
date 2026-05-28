@@ -4,7 +4,6 @@ use std::mem;
 pub const BLCKSZ: u32 = 8192;
 pub const XLOG_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 pub const XLOG_BLCKSZ: usize = 8192;
-pub const XLOG_PAGE_MAGIC: u16 = 0xD118;
 pub const XLP_FIRST_IS_CONTRECORD: u16 = 0x0001;
 pub const XLP_LONG_HEADER: u16 = 0x0002;
 pub const INVALID_BLOCK_NUMBER: BlockNumber = 0xFFFFFFFF;

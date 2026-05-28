@@ -41,6 +41,7 @@ fn main() {
         .allowlist_type("BlockNumber")
         .allowlist_type("ForkNumber")
         .allowlist_var("InvalidBlockNumber")
+        .allowlist_var("XLOG_PAGE_MAGIC")
         .generate()
         .expect("Unable to generate bindings");
 

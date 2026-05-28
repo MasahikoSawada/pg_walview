@@ -261,7 +261,7 @@ impl WALReader {
 
         let header = XLogPageHeaderData::from_bytes(&self.page_buffer).unwrap();
 
-        if header.xlp_magic != XLOG_PAGE_MAGIC {
+        if header.xlp_magic != XLOG_PAGE_MAGIC as u16 {
             return Err(WALReaderError::InvalidPageMagicNumber {
                 magic: header.xlp_magic,
                 segno: self.seg_no,
