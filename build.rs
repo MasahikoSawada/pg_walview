@@ -48,6 +48,9 @@ fn main() {
         .allowlist_var("XLOG_PAGE_MAGIC")
         .allowlist_var("BLCKSZ")
         .allowlist_var("XLOG_BLCKSZ")
+        .allowlist_var("PG_VERSION")
+        .allowlist_var("PG_MAJORVERSION")
+        .allowlist_var("PG_VERSION_NUM")
         .generate()
         .expect("Unable to generate bindings");
 

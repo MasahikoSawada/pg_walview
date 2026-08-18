@@ -63,7 +63,13 @@ pub enum WALReaderError {
     #[error("incorrect resource manager data checksum in record at {}", lsn_format(*lsn))]
     InvalidRecordCrc { lsn: XLogRecPtr },
 
-    #[error("invalid magic number {:04X} (expected {:04X}) at {}; this WAL was written by a different PostgreSQL major version", magic, XLOG_PAGE_MAGIC, lsn_format(*lsn))]
+    #[error(
+        "invalid magic number {:04X} at {}; pg_walview was built for PostgreSQL {} and reads only magic {:04X}",
+        magic,
+        lsn_format(*lsn),
+        crate::buildinfo::pg_version(),
+        crate::buildinfo::xlog_page_magic()
+    )]
     InvalidPageMagicNumber { magic: u16, lsn: XLogRecPtr },
 
     #[error("invalid page flags {:04X} at {}", flags, lsn_format(*lsn))]

@@ -1,5 +1,6 @@
 pub mod brindesc;
 pub mod btdesc;
+pub mod buildinfo;
 pub mod clogdesc;
 pub mod committsdesc;
 pub mod crc32c;

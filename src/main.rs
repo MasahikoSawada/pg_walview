@@ -17,6 +17,7 @@ use ratatui::{
 };
 
 use pg_walview::bindings::*;
+use pg_walview::buildinfo;
 use pg_walview::rmgr::RmgrId;
 use pg_walview::walmain::{describe_block_data, describe_main_data, describe_record};
 use pg_walview::walmisc::*;
@@ -1130,16 +1131,113 @@ impl Widget for &mut App {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Command line
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Command {
+    Help,
+    Version,
+    Open(String),
+}
+
+/// Two flags do not justify a command-line parsing crate.
+fn parse_args(args: &[String]) -> Result<Command, String> {
+    let mut path: Option<&str> = None;
+
+    for arg in args.iter().skip(1) {
+        match arg.as_str() {
+            // Asked for explicitly, so they win over anything else on the
+            // line: --help has to work even when the rest is wrong.
+            "-h" | "--help" => return Ok(Command::Help),
+            "-V" | "--version" => return Ok(Command::Version),
+            other if other.starts_with('-') && other != "-" => {
+                return Err(format!("unknown option '{}'", other));
+            }
+            other if path.is_none() => path = Some(other),
+            _ => return Err("expected one WAL segment file".to_string()),
+        }
+    }
+
+    match path {
+        Some(p) => Ok(Command::Open(p.to_string())),
+        None => Err("no WAL segment file given".to_string()),
+    }
+}
+
+fn version_text() -> String {
+    format!(
+        "pg_walview {}\n{}",
+        buildinfo::VERSION,
+        buildinfo::build_line()
+    )
+}
+
+fn help_text() -> String {
+    format!(
+        "\
+{version}
+
+Usage: pg_walview <WAL_SEGMENT_FILE>
+
+An interactive viewer for PostgreSQL write-ahead log segments.  A segment can
+only be read if its page magic matches the one above, which is taken from the
+server headers this binary was built against.
+
+Options:
+  -h, --help     Print this help
+  -V, --version  Print version information
+
+Record list:
+  j, Down        Next record
+  k, Up          Previous record
+  g, G           First / last record
+  s, r           Next / previous record with the same XID
+  Space, -       Page down / page up
+
+DETAILS pane:
+  Up, Down       Move the cursor between items
+  Enter          Expand / collapse the item under the cursor
+
+HEX DUMP pane:
+  j, Down        Scroll down one line
+  k, Up          Scroll up one line
+  Space, -       Page down / page up
+  g              Back to the selected record
+  G              End of the segment
+
+Anywhere:
+  Tab            Switch pane
+  q              Quit
+",
+        version = version_text()
+    )
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <path_to_wal_file>", args[0]);
-        std::process::exit(1);
-    }
+
+    let path = match parse_args(&args) {
+        Ok(Command::Help) => {
+            print!("{}", help_text());
+            return Ok(());
+        }
+        Ok(Command::Version) => {
+            println!("{}", version_text());
+            return Ok(());
+        }
+        Ok(Command::Open(path)) => path,
+        Err(message) => {
+            eprintln!("pg_walview: {}", message);
+            eprintln!("Try 'pg_walview --help' for more information.");
+            std::process::exit(1);
+        }
+    };
 
     // Load before touching the terminal, so a failure here reports the real
     // reason on stderr instead of inside the alternate screen.
-    let mut app = App::new(&args[1])?;
+    let mut app = App::new(&path)?;
 
     ratatui::run(|terminal| app.run(terminal))?;
 
@@ -1150,6 +1248,73 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use ratatui::layout::Rect;
+
+    fn parse(args: &[&str]) -> Result<Command, String> {
+        parse_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_single_path_is_the_segment_to_open() {
+        assert_eq!(
+            parse(&["pg_walview", "000000010000000000000001"]),
+            Ok(Command::Open("000000010000000000000001".to_string()))
+        );
+        // A path can start with a dash-free name that looks like nothing else.
+        assert_eq!(
+            parse(&["pg_walview", "./pg_wal/000000010000000000000001"]),
+            Ok(Command::Open(
+                "./pg_wal/000000010000000000000001".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn help_and_version_are_recognised_in_both_spellings() {
+        assert_eq!(parse(&["pg_walview", "-h"]), Ok(Command::Help));
+        assert_eq!(parse(&["pg_walview", "--help"]), Ok(Command::Help));
+        assert_eq!(parse(&["pg_walview", "-V"]), Ok(Command::Version));
+        assert_eq!(parse(&["pg_walview", "--version"]), Ok(Command::Version));
+        // They win over a path, so --help always works.
+        assert_eq!(parse(&["pg_walview", "seg", "--help"]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn a_missing_or_unknown_argument_is_reported() {
+        assert!(parse(&["pg_walview"]).is_err());
+        let err = parse(&["pg_walview", "--wat"]).unwrap_err();
+        assert!(err.contains("--wat"), "{}", err);
+        let err = parse(&["pg_walview", "a", "b"]).unwrap_err();
+        assert!(err.contains("one"), "{}", err);
+    }
+
+    #[test]
+    fn help_names_the_version_the_binary_reads() {
+        let text = help_text();
+        assert!(text.contains(buildinfo::VERSION), "{}", text);
+        assert!(text.contains(buildinfo::pg_version()), "{}", text);
+        assert!(
+            text.contains(&format!("{:04X}", buildinfo::xlog_page_magic())),
+            "{}",
+            text
+        );
+        // The keybindings are in there too, so they can be read without
+        // starting the TUI.
+        for key in ["Tab", "Enter", "same XID", "HEX DUMP"] {
+            assert!(text.contains(key), "missing {:?} in:\n{}", key, text);
+        }
+    }
+
+    #[test]
+    fn version_names_the_version_the_binary_reads() {
+        let text = version_text();
+        assert!(text.contains(buildinfo::VERSION), "{}", text);
+        assert!(text.contains(buildinfo::pg_version()), "{}", text);
+        assert!(
+            text.contains(&format!("{:04X}", buildinfo::xlog_page_magic())),
+            "{}",
+            text
+        );
+    }
 
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()

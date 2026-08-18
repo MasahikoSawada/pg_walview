@@ -27,9 +27,23 @@ PG_INCLUDE_DIR=/path/to/pgsql/include/server cargo build --release
 
 pg_walview reads WAL written by the PostgreSQL version whose headers it was
 built against: the WAL page magic and the on-disk struct layouts are taken from
-those headers at build time. Opening a segment from a different major version
-reports the magic number mismatch rather than misreading it. It has been tested
-against PostgreSQL 18 and later.
+those headers at build time. Opening a segment from a different version reports
+the magic number mismatch rather than misreading it. It has been tested against
+PostgreSQL 18 and later.
+
+`pg_walview --version` prints which PostgreSQL a given binary was built for,
+along with the WAL page magic it accepts:
+
+```bash
+$ pg_walview --version
+pg_walview 0.1.0
+Built for PostgreSQL 18.4 (WAL page magic 0xD118)
+```
+
+The page magic, not the version number, is what decides whether a segment can
+be read. It is stable across a released major version, but it also changes
+during a development cycle, so a binary built from a `master` snapshot only
+reads WAL from a server at the same point in that cycle.
 
 The WAL page size and segment size are read from the segment's own long page
 header, so a cluster initdb'd with a non-default `--wal-segsize` works.
@@ -41,6 +55,11 @@ Simply pass the path to a PostgreSQL WAL file as an argument:
 ```bash
 pg_walview /path/to/pg_wal/000000010000000000000001
 ```
+
+| Option | Action |
+|--------|--------|
+| `-h`, `--help` | Print usage and the full list of keybindings |
+| `-V`, `--version` | Print the version and the PostgreSQL it was built for |
 
 # Keybindings
 
