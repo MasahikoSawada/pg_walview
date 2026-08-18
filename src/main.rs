@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::env;
 use std::io;
+use std::ops::Range;
 use std::path::PathBuf;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -107,9 +108,28 @@ impl DetailTree {
     }
 }
 
+/// Repositioning of the hex pane requested by a key or by a change of
+/// selection, resolved at render time when the pane geometry is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HexJump {
+    None,
+    ToSelection,
+    ToEnd,
+}
+
+/// The raw segment behind the hex dump pane.
+#[derive(Debug, Default)]
+struct Segment {
+    bytes: Vec<u8>,
+    /// LSN of byte 0.
+    start_lsn: XLogRecPtr,
+    xlog_blcksz: usize,
+}
+
 #[derive(Debug)]
 pub struct App {
     records: Vec<WALRecordInfo>,
+    segment: Segment,
     current_file: PathBuf,
     /// Why the reader stopped short of the end of the segment, if it did.
     stop_reason: Option<String>,
@@ -124,10 +144,13 @@ pub struct App {
     detail_tree: DetailTree,
     detail_scroll: usize,
     hex_scroll: usize,
+    hex_jump: HexJump,
     exit: bool,
 }
 
 const PAGE_JUMP_SIZE: usize = 20;
+/// Lines of context kept above the selected record in the hex pane.
+const HEX_JUMP_MARGIN: usize = 2;
 
 impl App {
     pub fn new(path: &str) -> Result<Self> {
@@ -158,10 +181,20 @@ impl App {
                 .with_context(|| format!("could not read WAL file '{}'", path));
         }
 
+        // The hex pane dumps the whole segment, not just the selected
+        // record, so keep the file itself around.
+        let segment = Segment {
+            bytes: std::fs::read(path)
+                .with_context(|| format!("could not read WAL file '{}'", path))?,
+            start_lsn: reader.segment_start_lsn(),
+            xlog_blcksz: reader.xlog_blcksz(),
+        };
+
         Ok(Self::with_records(
             PathBuf::from(path),
             records,
             stop_reason,
+            segment,
         ))
     }
 
@@ -169,6 +202,7 @@ impl App {
         current_file: PathBuf,
         records: Vec<WALRecordInfo>,
         stop_reason: Option<String>,
+        segment: Segment,
     ) -> Self {
         let mut state = TableState::default();
         if !records.is_empty() {
@@ -177,6 +211,7 @@ impl App {
 
         let mut app = App {
             records,
+            segment,
             state,
             current_file,
             stop_reason,
@@ -186,6 +221,7 @@ impl App {
             detail_tree: DetailTree::default(),
             detail_scroll: 0,
             hex_scroll: 0,
+            hex_jump: HexJump::ToSelection,
             exit: false,
         };
         app.on_record_change();
@@ -266,14 +302,20 @@ impl App {
 
     fn handle_hex_dump_key(&mut self, key_event: KeyEvent) {
         match key_event.code {
-            KeyCode::Up => self.hex_scroll = self.hex_scroll.saturating_sub(1),
-            KeyCode::Down => self.hex_scroll = self.hex_scroll.saturating_add(1),
-            KeyCode::PageUp | KeyCode::Char('b') => {
+            KeyCode::Up | KeyCode::Char('k') => self.hex_scroll = self.hex_scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.hex_scroll = self.hex_scroll.saturating_add(1)
+            }
+            KeyCode::PageUp | KeyCode::Char('-') | KeyCode::Char('b') => {
                 self.hex_scroll = self.hex_scroll.saturating_sub(PAGE_JUMP_SIZE)
             }
             KeyCode::PageDown | KeyCode::Char(' ') => {
                 self.hex_scroll = self.hex_scroll.saturating_add(PAGE_JUMP_SIZE)
             }
+            // The dump covers the whole segment, so getting back to the
+            // selected record needs its own key.
+            KeyCode::Char('g') => self.hex_jump = HexJump::ToSelection,
+            KeyCode::Char('G') => self.hex_jump = HexJump::ToEnd,
             _ => {}
         }
     }
@@ -357,7 +399,7 @@ impl App {
 
     fn on_record_change(&mut self) {
         self.detail_scroll = 0;
-        self.hex_scroll = 0;
+        self.hex_jump = HexJump::ToSelection;
         self.xid_range = None;
 
         let Some(idx) = self.state.selected() else {
@@ -591,35 +633,153 @@ fn build_detail_lines(
     (lines, cursor_line)
 }
 
-/// Build hex dump lines for the given raw bytes.
-fn build_hex_lines(raw: &[u8]) -> Vec<Line<'static>> {
-    raw.chunks(16)
-        .enumerate()
-        .map(|(chunk_idx, chunk)| {
-            let offset = chunk_idx * 16;
-            let hex: String = chunk
-                .chunks(4)
-                .map(|g| {
-                    g.iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .collect::<Vec<_>>()
-                .join("  ");
-            let ascii: String = chunk
-                .iter()
-                .map(|&b| {
-                    if (0x20..0x7f).contains(&b) {
-                        b as char
-                    } else {
-                        '.'
-                    }
-                })
-                .collect();
-            Line::from(format!("{:04x}: {:<51}  {}", offset, hex, ascii))
-        })
-        .collect()
+// ---------------------------------------------------------------------------
+// HEX DUMP pane
+// ---------------------------------------------------------------------------
+
+/// What a byte of the segment is, which decides how it is coloured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ByteKind {
+    /// Part of the record currently selected in the list.
+    Record,
+    /// Part of a WAL page header, which splits records that cross pages.
+    PageHeader,
+    /// Anything else.
+    Plain,
+}
+
+/// Width of the "<lsn> <offset>: " prefix.
+const HEX_PREFIX_WIDTH: usize = 10 + 1 + 8 + 2;
+/// Bytes are printed in groups of four, separated by an extra space.
+const HEX_GROUP: usize = 4;
+
+/// Width of the hex column for `n` bytes per line.
+fn hex_column_width(n: usize) -> usize {
+    let groups = n.div_ceil(HEX_GROUP);
+    n * 3 - 1 + groups.saturating_sub(1)
+}
+
+/// Widest layout that fits the pane.  Falling back keeps the dump readable on
+/// a narrow terminal instead of cutting the line off.
+fn hex_bytes_per_line(inner_width: u16) -> usize {
+    let width = inner_width as usize;
+    [16usize, 8]
+        .into_iter()
+        .find(|&n| HEX_PREFIX_WIDTH + hex_column_width(n) + 2 + n <= width)
+        .unwrap_or(4)
+}
+
+/// Renders the whole WAL segment as a hex dump, marking the bytes of the
+/// selected record and the page headers.
+struct HexDump<'a> {
+    bytes: &'a [u8],
+    /// LSN of byte 0 of the segment.
+    start_lsn: XLogRecPtr,
+    xlog_blcksz: usize,
+    bytes_per_line: usize,
+}
+
+impl HexDump<'_> {
+    fn total_lines(&self) -> usize {
+        self.bytes.len().div_ceil(self.bytes_per_line)
+    }
+
+    /// Size of the page header at the start of the page holding `offset`.
+    /// Only the first page of a segment carries a long header, but rather than
+    /// assume that, read the flag out of the page itself.
+    fn page_header_size(&self, offset: usize) -> usize {
+        let page_start = offset - offset % self.xlog_blcksz;
+        let info = self
+            .bytes
+            .get(page_start + 2..page_start + 4)
+            .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+            .unwrap_or(0);
+        if info & XLP_LONG_HEADER != 0 { 40 } else { 24 }
+    }
+
+    fn classify(&self, offset: usize, record: &[Range<usize>]) -> ByteKind {
+        if offset % self.xlog_blcksz < self.page_header_size(offset) {
+            return ByteKind::PageHeader;
+        }
+        if record.iter().any(|r| r.contains(&offset)) {
+            return ByteKind::Record;
+        }
+        ByteKind::Plain
+    }
+
+    fn style_for(kind: ByteKind) -> Style {
+        match kind {
+            ByteKind::Record => Style::default().add_modifier(Modifier::REVERSED),
+            ByteKind::PageHeader => Style::default().fg(Color::DarkGray),
+            ByteKind::Plain => Style::default(),
+        }
+    }
+
+    /// One line of the dump, with runs of same-kind bytes merged into a span.
+    fn line(&self, line_idx: usize, record: &[Range<usize>]) -> Line<'static> {
+        let start = line_idx * self.bytes_per_line;
+        let end = (start + self.bytes_per_line).min(self.bytes.len());
+
+        let mut spans = vec![Span::raw(format!(
+            "{:<10} {:08x}: ",
+            lsn_format(self.start_lsn + start as u64),
+            start
+        ))];
+
+        let flush = |spans: &mut Vec<Span<'static>>, text: &mut String, kind: ByteKind| {
+            if !text.is_empty() {
+                spans.push(Span::styled(std::mem::take(text), Self::style_for(kind)));
+            }
+        };
+
+        // Hex column, split into runs so a record that starts mid-line is
+        // highlighted from exactly the right byte.
+        let mut hex = String::new();
+        let mut hex_width = 0usize;
+        let mut run = self.classify(start, record);
+        for offset in start..end {
+            let kind = self.classify(offset, record);
+            if kind != run {
+                hex_width += hex.chars().count();
+                flush(&mut spans, &mut hex, run);
+                run = kind;
+            }
+            let col = offset - start;
+            if col > 0 {
+                hex.push(' ');
+                if col.is_multiple_of(HEX_GROUP) {
+                    hex.push(' ');
+                }
+            }
+            hex.push_str(&format!("{:02x}", self.bytes[offset]));
+        }
+        hex_width += hex.chars().count();
+        flush(&mut spans, &mut hex, run);
+
+        // Pad a short final line so the ASCII column stays aligned.
+        let pad = hex_column_width(self.bytes_per_line).saturating_sub(hex_width) + 2;
+        spans.push(Span::raw(" ".repeat(pad)));
+
+        // ASCII column, highlighted the same way.
+        let mut ascii = String::new();
+        let mut run = self.classify(start, record);
+        for offset in start..end {
+            let kind = self.classify(offset, record);
+            if kind != run {
+                flush(&mut spans, &mut ascii, run);
+                run = kind;
+            }
+            let b = self.bytes[offset];
+            ascii.push(if (0x20..0x7f).contains(&b) {
+                b as char
+            } else {
+                '.'
+            });
+        }
+        flush(&mut spans, &mut ascii, run);
+
+        Line::from(spans)
+    }
 }
 
 /// Build a DetailTree with everything expanded (for auto-expand check).
@@ -856,26 +1016,59 @@ impl App {
         }
 
         let hex_active = self.focus == FocusPane::HexDump;
-        let inner_h = area.height.saturating_sub(2) as usize;
+        let visible = area.height.saturating_sub(2) as usize;
 
-        let hex_lines = match self.records.get(self.state.selected().unwrap_or(0)) {
-            Some(record) => build_hex_lines(&record.raw),
-            None => vec![],
+        let dump = HexDump {
+            bytes: &self.segment.bytes,
+            start_lsn: self.segment.start_lsn,
+            xlog_blcksz: self.segment.xlog_blcksz.max(1),
+            bytes_per_line: hex_bytes_per_line(area.width.saturating_sub(2)),
+        };
+        let total_lines = dump.total_lines();
+
+        let selected = self
+            .state
+            .selected()
+            .and_then(|i| self.records.get(i))
+            .map(|r| (r.lsn, r.file_ranges.clone()))
+            .unwrap_or((0, Vec::new()));
+        let (record_lsn, record_ranges) = selected;
+
+        // Resolve a pending jump now that the geometry is known.
+        match self.hex_jump {
+            HexJump::ToSelection => {
+                if let Some(first) = record_ranges.first() {
+                    // Leave a little context above the record.
+                    self.hex_scroll =
+                        (first.start / dump.bytes_per_line).saturating_sub(HEX_JUMP_MARGIN);
+                }
+            }
+            HexJump::ToEnd => self.hex_scroll = total_lines.saturating_sub(visible),
+            HexJump::None => {}
+        }
+        self.hex_jump = HexJump::None;
+        self.hex_scroll = self.hex_scroll.min(total_lines.saturating_sub(visible));
+
+        // Only the lines on screen are built; a 16MB segment is a million of
+        // them.
+        let lines: Vec<Line> = (self.hex_scroll..(self.hex_scroll + visible).min(total_lines))
+            .map(|i| dump.line(i, &record_ranges))
+            .collect();
+
+        let title = if record_ranges.is_empty() {
+            "HEX DUMP".to_string()
+        } else {
+            format!("HEX DUMP  (record {})", lsn_format(record_lsn))
         };
 
-        // Do not let the pane scroll past its last line.
-        let max_scroll = hex_lines.len().saturating_sub(inner_h.max(1));
-        self.hex_scroll = self.hex_scroll.min(max_scroll);
-
-        Paragraph::new(hex_lines)
+        Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title("HEX DUMP")
+                    .title(title)
                     .borders(Borders::ALL)
                     .border_style(border_style(hex_active))
                     .merge_borders(MergeStrategy::Exact),
             )
-            .scroll((self.hex_scroll as u16, 0))
             .render(area, buf);
     }
 
@@ -958,6 +1151,143 @@ mod tests {
     use super::*;
     use ratatui::layout::Rect;
 
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// A stand-in segment: a long page header on page 0, then counting bytes.
+    fn test_segment() -> Vec<u8> {
+        let mut seg = vec![0u8; 3 * 8192];
+        for (i, b) in seg.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        // Mark page 0 as carrying a long header and pages 1-2 short ones.
+        seg[2..4].copy_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+        seg[8192 + 2..8192 + 4].copy_from_slice(&0u16.to_le_bytes());
+        seg[2 * 8192 + 2..2 * 8192 + 4].copy_from_slice(&0u16.to_le_bytes());
+        seg
+    }
+
+    /// Far enough into the segment that it is off the first screen.
+    const MARK_AT: usize = 20_000;
+
+    /// A record that lives on a single page occupies one range; clippy reads
+    /// a one-element list of ranges as a mistyped `(a..b).collect()`.
+    #[allow(clippy::single_range_in_vec_init, reason = "one range, not a collect")]
+    fn one_range(start: usize, len: usize) -> Vec<Range<usize>> {
+        vec![start..start + len]
+    }
+
+    fn test_seg() -> Segment {
+        Segment {
+            bytes: test_segment(),
+            start_lsn: 3 * 0x100000,
+            xlog_blcksz: 8192,
+        }
+    }
+
+    fn test_dump(bytes: &[u8], bytes_per_line: usize) -> HexDump<'_> {
+        HexDump {
+            bytes,
+            start_lsn: 3 * 0x100000,
+            xlog_blcksz: 8192,
+            bytes_per_line,
+        }
+    }
+
+    /// The line has to hold "<lsn> <offset>: <hex>  <ascii>"; when the pane is
+    /// too narrow for 16 bytes it has to fall back rather than truncate.
+    #[test]
+    fn bytes_per_line_is_chosen_to_fit_the_pane() {
+        assert_eq!(hex_bytes_per_line(200), 16);
+        assert_eq!(hex_bytes_per_line(89), 16);
+        assert_eq!(hex_bytes_per_line(88), 8);
+        assert_eq!(hex_bytes_per_line(55), 8);
+        assert_eq!(hex_bytes_per_line(54), 4);
+        assert_eq!(hex_bytes_per_line(10), 4);
+    }
+
+    #[test]
+    fn a_hex_line_shows_both_the_lsn_and_the_file_offset() {
+        let seg = test_segment();
+        let dump = test_dump(&seg, 8);
+
+        // Line 1 starts at file offset 8.
+        assert_eq!(
+            line_text(&dump.line(1, &[])),
+            "0/00300008 00000008: 08 09 0a 0b  0c 0d 0e 0f  ........"
+        );
+        // Line 8 starts at offset 0x40, where the bytes are printable ASCII.
+        assert_eq!(
+            line_text(&dump.line(8, &[])),
+            "0/00300040 00000040: 40 41 42 43  44 45 46 47  @ABCDEFG"
+        );
+    }
+
+    #[test]
+    fn the_last_line_is_not_padded_with_phantom_bytes() {
+        let seg = vec![0xAAu8; 20];
+        let dump = test_dump(&seg, 8);
+        assert_eq!(dump.total_lines(), 3);
+        assert_eq!(
+            line_text(&dump.line(2, &[])),
+            "0/00300010 00000010: aa aa aa aa               ...."
+        );
+    }
+
+    #[test]
+    fn record_bytes_are_told_apart_from_page_headers_and_the_rest() {
+        let seg = test_segment();
+        let dump = test_dump(&seg, 16);
+        let record = vec![40..8192, 8192 + 24..8192 + 100];
+
+        // Page 0's long header, then the record, then untouched bytes.
+        assert_eq!(dump.classify(0, &record), ByteKind::PageHeader);
+        assert_eq!(dump.classify(39, &record), ByteKind::PageHeader);
+        assert_eq!(dump.classify(40, &record), ByteKind::Record);
+        assert_eq!(dump.classify(8191, &record), ByteKind::Record);
+
+        // The page header that splits the record must not look like part of it.
+        assert_eq!(dump.classify(8192, &record), ByteKind::PageHeader);
+        assert_eq!(dump.classify(8192 + 23, &record), ByteKind::PageHeader);
+        assert_eq!(dump.classify(8192 + 24, &record), ByteKind::Record);
+        assert_eq!(dump.classify(8192 + 99, &record), ByteKind::Record);
+        assert_eq!(dump.classify(8192 + 100, &record), ByteKind::Plain);
+
+        // A later page's header is dimmed even with no record near it.
+        assert_eq!(dump.classify(2 * 8192 + 10, &record), ByteKind::PageHeader);
+        assert_eq!(dump.classify(2 * 8192 + 24, &record), ByteKind::Plain);
+
+        // Page header always wins: a range that runs straight across a page
+        // boundary must not make the header look like record content.
+        let spanning = one_range(8100, 200);
+        assert_eq!(dump.classify(8191, &spanning), ByteKind::Record);
+        assert_eq!(dump.classify(8192, &spanning), ByteKind::PageHeader);
+        assert_eq!(dump.classify(8192 + 23, &spanning), ByteKind::PageHeader);
+        assert_eq!(dump.classify(8192 + 24, &spanning), ByteKind::Record);
+    }
+
+    #[test]
+    fn only_the_record_bytes_on_a_line_are_highlighted() {
+        let seg = test_segment();
+        let dump = test_dump(&seg, 16);
+        // A record starting mid-line, at offset 0x44.
+        let mark = one_range(0x44, 12);
+        let line = dump.line(4, &mark);
+
+        let highlighted: String = line
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        // Bytes 0x40-0x43 stay plain; 0x44 onwards are highlighted, in the
+        // hex column and in the ASCII column alike.
+        assert!(highlighted.contains("44 45 46 47"), "{:?}", highlighted);
+        assert!(!highlighted.contains("40 41"), "{:?}", highlighted);
+        assert!(highlighted.contains("DEFGHIJKLMNO"), "{:?}", highlighted);
+    }
+
     fn record(lsn: XLogRecPtr, xid: TransactionId, rmid: u8) -> WALRecordInfo {
         let mut r = WALRecordInfo {
             lsn,
@@ -975,7 +1305,12 @@ mod tests {
         let records = (0..n)
             .map(|i| record(0x1000000 + i as u64 * 32, (i / 3) as u32 + 3, 10))
             .collect();
-        App::with_records(PathBuf::from("000000010000000000000001"), records, None)
+        App::with_records(
+            PathBuf::from("000000010000000000000001"),
+            records,
+            None,
+            test_seg(),
+        )
     }
 
     fn render(app: &mut App, area: Rect) -> Buffer {
@@ -988,7 +1323,7 @@ mod tests {
     /// first frame and take the whole program down.
     #[test]
     fn an_empty_record_list_renders() {
-        let mut app = App::with_records(PathBuf::from("seg"), vec![], None);
+        let mut app = App::with_records(PathBuf::from("seg"), vec![], None, test_seg());
         assert_eq!(app.state.selected(), None);
         render(&mut app, Rect::new(0, 0, 120, 40));
 
@@ -1007,7 +1342,12 @@ mod tests {
 
     #[test]
     fn a_single_record_renders() {
-        let mut app = App::with_records(PathBuf::from("seg"), vec![record(0x1000000, 0, 0)], None);
+        let mut app = App::with_records(
+            PathBuf::from("seg"),
+            vec![record(0x1000000, 0, 0)],
+            None,
+            test_seg(),
+        );
         render(&mut app, Rect::new(0, 0, 120, 40));
         app.move_bottom();
         app.move_record_down();
@@ -1038,6 +1378,7 @@ mod tests {
             PathBuf::from("seg"),
             vec![record(0x1000000, 5, 10)],
             Some("something went wrong".to_string()),
+            test_seg(),
         );
         let buf = render(&mut app, Rect::new(0, 0, 120, 40));
         let last_row: String = (0..120)
@@ -1095,6 +1436,7 @@ mod tests {
             PathBuf::from("seg"),
             vec![record(0x1000000, 0, 0), record(0x1000020, 0, 0)],
             None,
+            test_seg(),
         );
         app.move_next_same_xid();
         assert_eq!(app.state.selected(), Some(0));
@@ -1110,15 +1452,98 @@ mod tests {
         assert_eq!(app.xid_range, Some((6, 8)));
     }
 
+    /// The dump now covers the whole segment, so the pane has to be able to
+    /// leave the selected record and come back to it.
+    fn app_with_marked_record() -> App {
+        let mut seg = test_seg();
+        // A distinctive run of bytes where the record lives, so the tests can
+        // tell from the rendered screen whether it is on it.
+        seg.bytes[MARK_AT..MARK_AT + 4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let mut rec = record(0x1000000, 5, 10);
+        rec.file_ranges = one_range(MARK_AT, 4);
+        App::with_records(PathBuf::from("seg"), vec![rec], None, seg)
+    }
+
+    fn screen_text(buf: &Buffer) -> String {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
-    fn hex_scroll_stays_within_the_dump() {
-        let mut app = App::with_records(PathBuf::from("seg"), vec![record(0x1000000, 5, 10)], None);
+    fn the_dump_opens_on_the_selected_record() {
+        let mut app = app_with_marked_record();
+        let buf = render(&mut app, Rect::new(0, 0, 150, 45));
+        assert!(
+            screen_text(&buf).contains("de ad be ef"),
+            "the selected record should be on screen"
+        );
+    }
+
+    #[test]
+    fn the_dump_can_scroll_away_from_the_record_and_back() {
+        let mut app = app_with_marked_record();
+        let area = Rect::new(0, 0, 150, 45);
         app.focus = FocusPane::HexDump;
-        for _ in 0..100 {
+
+        app.handle_hex_dump_key(KeyEvent::from(KeyCode::Char('G')));
+        let buf = render(&mut app, area);
+        let at_end = app.hex_scroll;
+        assert!(at_end > 0, "G should move to the end of the segment");
+        assert!(!screen_text(&buf).contains("de ad be ef"));
+
+        app.handle_hex_dump_key(KeyEvent::from(KeyCode::Char('g')));
+        let buf = render(&mut app, area);
+        assert!(
+            screen_text(&buf).contains("de ad be ef"),
+            "g should come back to the selected record"
+        );
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_end_of_the_segment() {
+        let mut app = app_with_marked_record();
+        let area = Rect::new(0, 0, 150, 45);
+        app.focus = FocusPane::HexDump;
+
+        app.handle_hex_dump_key(KeyEvent::from(KeyCode::Char('G')));
+        render(&mut app, area);
+        let at_end = app.hex_scroll;
+
+        for _ in 0..5 {
             app.handle_hex_dump_key(KeyEvent::from(KeyCode::Down));
+            render(&mut app, area);
         }
-        render(&mut app, Rect::new(0, 0, 120, 40));
-        // 24 raw bytes is two hex lines, so there is nothing to scroll to.
-        assert_eq!(app.hex_scroll, 0);
+        assert_eq!(app.hex_scroll, at_end, "must not scroll past the last line");
+    }
+
+    #[test]
+    fn changing_the_selection_moves_the_dump_to_the_new_record() {
+        let mut seg = test_seg();
+        seg.bytes[MARK_AT..MARK_AT + 4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        seg.bytes[100..104].copy_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+
+        let mut first = record(0x1000064, 5, 10);
+        first.file_ranges = one_range(100, 4);
+        let mut second = record(0x1000000 + MARK_AT as u64, 5, 10);
+        second.file_ranges = one_range(MARK_AT, 4);
+
+        let mut app = App::with_records(PathBuf::from("seg"), vec![first, second], None, seg);
+        let area = Rect::new(0, 0, 150, 45);
+
+        let buf = render(&mut app, area);
+        assert!(screen_text(&buf).contains("ca fe ba be"));
+
+        app.move_record_down();
+        let buf = render(&mut app, area);
+        assert!(
+            screen_text(&buf).contains("de ad be ef"),
+            "selecting a record should bring it into view"
+        );
     }
 }

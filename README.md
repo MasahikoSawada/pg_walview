@@ -8,6 +8,7 @@ A modernized, interactive TUI alternative to `pg_waldump` for exploring PostgreS
 
 - Visual Transaction Tracking: Visually track `COMMIT`s and `ABORT`s with colored, dynamically drawn graph lines.
 - Deep Drill-down: Detail split view. Inspect `XLogRecord` details, block-level information (`RelFileNode`), and Full Page Images (FPI) instantly.
+- Whole-segment hex dump with the selected record highlighted in place, addressed by LSN and file offset.
 - Record checksums are verified (`xl_crc`), and a record that fails is flagged in the list and in the detail pane.
 - The segment a server is currently writing can be opened; reading stops at the point the WAL has been written up to.
 
@@ -63,13 +64,21 @@ In the DETAILS pane:
 | `↑` / `↓` | Move the cursor between items              |
 | `Enter`    | Expand / collapse the item under the cursor |
 
-In the HEX DUMP pane:
+The HEX DUMP pane dumps the whole WAL segment, with the bytes of the selected
+record highlighted and WAL page headers dimmed, so a record can be read in the
+context of the pages it lives on. Each line is addressed by both LSN and file
+offset. A record that crosses a page boundary is highlighted in the two (or
+more) pieces it actually occupies in the file; the page header that splits it
+is not.
 
 | Key        | Action                                    |
 |------------|-------------------------------------------|
-| `↑` / `↓` | Scroll one line                            |
+| `↑` / `k`  | Scroll up one line                         |
+| `↓` / `j`  | Scroll down one line                       |
 | `Space` / `PageDown` | Scroll down a page               |
-| `b` / `PageUp`       | Scroll up a page                 |
+| `-` / `b` / `PageUp` | Scroll up a page                 |
+| `g`        | Jump back to the selected record            |
+| `G`        | Jump to the end of the segment              |
 
 
 # License

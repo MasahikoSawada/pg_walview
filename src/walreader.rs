@@ -154,6 +154,11 @@ pub struct WALRecordInfo {
     /// Whether xl_crc matched the record contents.
     pub crc_ok: bool,
 
+    /// Byte ranges the record occupies in the segment file.  A record that
+    /// crosses a page boundary is split by the next page's header, so this
+    /// has one entry per page it lives on.
+    pub file_ranges: Vec<Range<usize>>,
+
     // Raw bytes of the full record (header + payload).  All the ranges above
     // point into this, so the payload is stored exactly once.
     pub raw: Vec<u8>,
@@ -390,6 +395,11 @@ impl<R: Read + Seek> WALReader<R> {
         self.seg_size
     }
 
+    /// LSN of the first byte of the segment.
+    pub fn segment_start_lsn(&self) -> XLogRecPtr {
+        self.seg_no * self.seg_size
+    }
+
     pub fn xlog_blcksz(&self) -> usize {
         self.xlog_blcksz
     }
@@ -558,7 +568,8 @@ impl<R: Read + Seek> WALReader<R> {
     }
 
     /// Append `len` bytes of record content to `record_buffer`, starting at
-    /// `*offset` in the current page and continuing onto following pages.
+    /// `*offset` in the current page and continuing onto following pages, and
+    /// record where in the file those bytes came from.
     ///
     /// Returns the total size of the page headers stepped over, which the
     /// caller adds to `read_lsn`, or None if the readable data ends first.
@@ -566,6 +577,7 @@ impl<R: Read + Seek> WALReader<R> {
         &mut self,
         offset: &mut usize,
         len: usize,
+        file_ranges: &mut Vec<Range<usize>>,
     ) -> Result<Option<u64>, WALReaderError> {
         let mut remaining = len;
         let mut header_bytes = 0u64;
@@ -590,6 +602,15 @@ impl<R: Read + Seek> WALReader<R> {
             let take = cmp::min(remaining, self.xlog_blcksz - *offset);
             self.record_buffer
                 .extend_from_slice(&self.page_buffer[*offset..*offset + take]);
+
+            let start = self.page_no as usize * self.xlog_blcksz + *offset;
+            match file_ranges.last_mut() {
+                // The record header and its body are copied by separate calls
+                // but are adjacent in the file; keep them as one range.
+                Some(last) if last.end == start => last.end += take,
+                _ => file_ranges.push(start..start + take),
+            }
+
             *offset += take;
             remaining -= take;
         }
@@ -613,10 +634,11 @@ impl<R: Read + Seek> WALReader<R> {
 
         let mut offset = self.lsn_to_page_offset(self.read_lsn);
         let mut header_bytes = 0u64;
+        let mut file_ranges: Vec<Range<usize>> = Vec::new();
 
         // Read the XLogRecord header first; it may itself straddle a page
         // boundary.
-        match self.copy_record_bytes(&mut offset, SIZE_OF_XLOG_RECORD)? {
+        match self.copy_record_bytes(&mut offset, SIZE_OF_XLOG_RECORD, &mut file_ranges)? {
             Some(n) => header_bytes += n,
             None => {
                 self.done = true;
@@ -642,7 +664,7 @@ impl<R: Read + Seek> WALReader<R> {
 
         // xl_tot_len covers the XLogRecord header, which we already have.
         let body_len = tot_len as usize - SIZE_OF_XLOG_RECORD;
-        match self.copy_record_bytes(&mut offset, body_len)? {
+        match self.copy_record_bytes(&mut offset, body_len, &mut file_ranges)? {
             Some(n) => header_bytes += n,
             None => {
                 self.done = true;
@@ -657,6 +679,7 @@ impl<R: Read + Seek> WALReader<R> {
 
         let mut record = decode_wal_record(&self.record_buffer, self.record_lsn)?;
         record.crc_ok = verify_record_crc(&self.record_buffer);
+        record.file_ranges = file_ranges;
 
         if !record.crc_ok {
             // Past a bad CRC nothing in the stream can be trusted, in
@@ -1294,6 +1317,48 @@ mod tests {
         let (got, err) = read_all(&mut reader);
         assert!(err.is_none(), "unexpected error: {:?}", err);
         assert_eq!(got.len(), 1);
+    }
+
+    /// The hex dump highlights a record inside the whole segment, so it needs
+    /// to know which bytes of the file the record actually occupies.
+    #[test]
+    fn a_record_on_one_page_has_a_single_file_range() {
+        let rec = make_record(100, 10, 0, &main_data_body(b"first"));
+        let len = rec.len();
+        let mut reader = reader_for(build_segment(SEG_NO, &[rec])).unwrap();
+        let (got, err) = read_all(&mut reader);
+        assert!(err.is_none(), "unexpected error: {:?}", err);
+        // Page 0's long header is 40 bytes, the record follows it.
+        assert_eq!(got[0].file_ranges.len(), 1);
+        assert_eq!(got[0].file_ranges[0], 40..40 + len);
+    }
+
+    /// A record that crosses a page boundary is split by the next page's
+    /// header, so its bytes are not contiguous in the file.
+    #[test]
+    fn a_record_spanning_pages_has_one_file_range_per_page() {
+        let payload_len = BLK + 1000;
+        let mut body = vec![XLR_BLOCK_ID_DATA_LONG];
+        body.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        body.extend((0..payload_len).map(|i| i as u8));
+        let rec = make_record(100, 10, 0, &body);
+        let total = rec.len();
+
+        let mut reader = reader_for(build_segment(SEG_NO, &[rec])).unwrap();
+        let (got, err) = read_all(&mut reader);
+        assert!(err.is_none(), "unexpected error: {:?}", err);
+
+        // Page 0 holds what fits after its 40-byte long header, the rest
+        // follows page 1's 24-byte header.
+        let on_page0 = BLK - 40;
+        assert!(total > on_page0 && total < on_page0 + BLK - 24);
+        assert_eq!(
+            got[0].file_ranges,
+            vec![40..BLK, BLK + 24..BLK + 24 + (total - on_page0)]
+        );
+        // The ranges cover the record exactly once.
+        let covered: usize = got[0].file_ranges.iter().map(|r| r.len()).sum();
+        assert_eq!(covered, total);
     }
 
     #[test]
