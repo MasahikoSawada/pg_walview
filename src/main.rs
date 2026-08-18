@@ -10,11 +10,13 @@ use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect, Spacing},
-    style::{Color, Modifier, Style},
+    style::Style,
     symbols::merge::MergeStrategy,
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, StatefulWidget, Table, TableState, Widget},
 };
+
+mod theme;
 
 use pg_walview::bindings::*;
 use pg_walview::buildinfo;
@@ -74,6 +76,21 @@ impl DetailTree {
             items.push(NavItem::MainData);
         }
         items
+    }
+
+    /// Which parts of the record the cursor is on, so the hex dump can pick
+    /// out exactly those bytes.  A block item covers everything belonging to
+    /// that block: a block whose only payload is a full-page image would
+    /// otherwise light up nothing at all.
+    fn focused_parts(&self, record: &WALRecordInfo) -> Vec<RecordPart> {
+        let nav = self.nav_items(&record.blocks, record.has_main_data());
+        match nav.get(self.cursor) {
+            Some(NavItem::Header) => vec![RecordPart::Header],
+            Some(NavItem::Block(i)) => vec![RecordPart::Fpi(*i), RecordPart::BlockData(*i)],
+            Some(NavItem::BlockFpi(i)) => vec![RecordPart::Fpi(*i)],
+            Some(NavItem::MainData) => vec![RecordPart::MainData],
+            None => Vec::new(),
+        }
     }
 
     fn move_up(&mut self) {
@@ -425,27 +442,28 @@ impl App {
     }
 }
 
-fn border_style(active: bool) -> Style {
-    if active {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default().fg(Color::Gray)
-    }
-}
-
-fn make_item_line(text: String, is_cursor: bool) -> Line<'static> {
+/// An accordion heading, coloured by the part of the record it stands for so
+/// that it matches those bytes in the hex dump.
+fn make_item_line(text: String, part: RecordPart, is_cursor: bool) -> Line<'static> {
+    let mut style = theme::record_part(part);
     if is_cursor {
-        Line::from(Span::styled(
-            text,
-            Style::default().add_modifier(Modifier::REVERSED),
-        ))
-    } else {
-        Line::from(text)
+        style = style.patch(theme::cursor());
     }
+    Line::from(Span::styled(text, style))
 }
 
+/// Split a field line at its first colon so the key can recede and the value
+/// read at full strength.  Only the first, because a value can have colons of
+/// its own -- a timestamp does.  Splitting here rather than at the source
+/// leaves the twenty per-rmgr description modules alone.
 fn detail_field_line(text: String) -> Line<'static> {
-    Line::from(Span::styled(text, Style::default().fg(Color::Gray)))
+    match text.find(':') {
+        Some(i) => Line::from(vec![
+            Span::styled(text[..=i].to_string(), theme::detail_key()),
+            Span::styled(text[i + 1..].to_string(), theme::detail_value()),
+        ]),
+        None => Line::from(Span::styled(text, theme::detail_value())),
+    }
 }
 
 /// Build the lines for the DETAILS accordion and return (lines, cursor_line_index).
@@ -481,17 +499,17 @@ fn build_detail_lines(
                 if is_at_cursor {
                     cursor_line = lines.len();
                 }
-                lines.push(make_item_line(summary, is_cursor));
+                lines.push(make_item_line(summary, RecordPart::Header, is_cursor));
 
                 if tree.header_expanded {
-                    lines.push(detail_field_line(format!(
-                        "  LSN:      {}",
-                        lsn_format(record.lsn)
-                    )));
-                    lines.push(detail_field_line(format!(
-                        "  prev LSN: {}",
-                        lsn_format(record.xlrec.xl_prev)
-                    )));
+                    lines.push(Line::from(vec![
+                        Span::styled("  LSN:      ", theme::detail_key()),
+                        Span::styled(lsn_format(record.lsn), theme::lsn()),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("  prev LSN: ", theme::detail_key()),
+                        Span::styled(lsn_format(record.xlrec.xl_prev), theme::lsn()),
+                    ]));
                     lines.push(detail_field_line(format!(
                         "  XID:      {}",
                         record.xlrec.xl_xid
@@ -508,11 +526,21 @@ fn build_detail_lines(
                         "  tot_len:  {} bytes",
                         record.xlrec.xl_tot_len
                     )));
-                    lines.push(detail_field_line(format!(
-                        "  crc:      0x{:08X} ({})",
-                        record.xlrec.xl_crc,
-                        if record.crc_ok { "ok" } else { "MISMATCH" }
-                    )));
+                    lines.push(Line::from(vec![
+                        Span::styled("  crc:", theme::detail_key()),
+                        Span::styled(
+                            format!(
+                                "      0x{:08X} ({})",
+                                record.xlrec.xl_crc,
+                                if record.crc_ok { "ok" } else { "MISMATCH" }
+                            ),
+                            if record.crc_ok {
+                                theme::crc_ok()
+                            } else {
+                                theme::crc_bad()
+                            },
+                        ),
+                    ]));
                     lines.push(detail_field_line(format!(
                         "  top_xid:  {}",
                         record.top_xid.map_or("-".to_string(), |x| x.to_string())
@@ -540,7 +568,11 @@ fn build_detail_lines(
                 if is_at_cursor {
                     cursor_line = lines.len();
                 }
-                lines.push(make_item_line(summary, is_cursor));
+                lines.push(make_item_line(
+                    summary,
+                    RecordPart::BlockData(*i),
+                    is_cursor,
+                ));
 
                 if block_expanded {
                     lines.push(detail_field_line(format!(
@@ -552,10 +584,10 @@ fn build_detail_lines(
                         fork_name(block.forknum)
                     )));
                     lines.push(detail_field_line(format!("  blkno:  {}", block.blocknum)));
-                    lines.push(detail_field_line(format!(
-                        "  flags:  {}",
-                        block.flags_str()
-                    )));
+                    lines.push(Line::from(vec![
+                        Span::styled("  flags:", theme::detail_key()),
+                        Span::styled(format!("  {}", block.flags_str()), theme::flags()),
+                    ]));
                     if block.flags & BKPBLOCK_HAS_DATA != 0 {
                         lines.push(detail_field_line(format!(
                             "  data:   {} bytes",
@@ -583,7 +615,7 @@ fn build_detail_lines(
                     if is_at_cursor {
                         cursor_line = lines.len();
                     }
-                    lines.push(make_item_line(summary, is_cursor));
+                    lines.push(make_item_line(summary, RecordPart::Fpi(*i), is_cursor));
 
                     if fpi_expanded {
                         lines.push(detail_field_line(format!(
@@ -616,7 +648,7 @@ fn build_detail_lines(
                 if is_at_cursor {
                     cursor_line = lines.len();
                 }
-                lines.push(make_item_line(summary, is_cursor));
+                lines.push(make_item_line(summary, RecordPart::MainData, is_cursor));
 
                 if tree.main_expanded {
                     lines.push(detail_field_line(format!(
@@ -641,12 +673,59 @@ fn build_detail_lines(
 /// What a byte of the segment is, which decides how it is coloured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ByteKind {
-    /// Part of the record currently selected in the list.
-    Record,
     /// Part of a WAL page header, which splits records that cross pages.
     PageHeader,
+    /// Part of the record currently selected in the list, and which part.
+    Record(RecordPart),
+    /// A zero byte outside the selected record.  WAL is full of them, and
+    /// dimming them is what lets the structure show through.
+    Zero,
     /// Anything else.
     Plain,
+}
+
+/// Where the parts of the selected record sit in the file, and which part the
+/// DETAILS cursor is on.
+struct RecordOverlay {
+    /// File ranges, in ascending order.
+    parts: Vec<(Range<usize>, RecordPart)>,
+    /// The parts the DETAILS cursor is on.  Empty when the accordion is in
+    /// auto-expand mode and shows no cursor.
+    focus: Vec<RecordPart>,
+}
+
+impl RecordOverlay {
+    fn empty() -> Self {
+        RecordOverlay {
+            parts: Vec::new(),
+            focus: Vec::new(),
+        }
+    }
+
+    /// The parts address `raw`; the dump addresses the file, so each one is
+    /// mapped over, and a part split by a page header becomes two ranges.
+    fn of(record: &WALRecordInfo, focus: Vec<RecordPart>) -> Self {
+        let mut parts = Vec::new();
+        for (raw, part) in record.parts() {
+            for range in record.file_ranges_of(raw) {
+                parts.push((range, part));
+            }
+        }
+        parts.sort_by_key(|(r, _)| r.start);
+        RecordOverlay { parts, focus }
+    }
+
+    fn part_at(&self, offset: usize) -> Option<RecordPart> {
+        // A record has a handful of parts, so a scan beats an index.
+        self.parts
+            .iter()
+            .find(|(r, _)| r.contains(&offset))
+            .map(|(_, p)| *p)
+    }
+
+    fn first_byte(&self) -> Option<usize> {
+        self.parts.first().map(|(r, _)| r.start)
+    }
 }
 
 /// Width of the "<lsn> <offset>: " prefix.
@@ -698,38 +777,69 @@ impl HexDump<'_> {
         if info & XLP_LONG_HEADER != 0 { 40 } else { 24 }
     }
 
-    fn classify(&self, offset: usize, record: &[Range<usize>]) -> ByteKind {
+    fn classify(&self, offset: usize, overlay: &RecordOverlay) -> ByteKind {
+        // A page header is never record content, whatever the ranges say.
         if offset % self.xlog_blcksz < self.page_header_size(offset) {
             return ByteKind::PageHeader;
         }
-        if record.iter().any(|r| r.contains(&offset)) {
-            return ByteKind::Record;
+        if let Some(part) = overlay.part_at(offset) {
+            return ByteKind::Record(part);
+        }
+        if self.bytes.get(offset) == Some(&0) {
+            return ByteKind::Zero;
         }
         ByteKind::Plain
     }
 
-    fn style_for(kind: ByteKind) -> Style {
-        match kind {
-            ByteKind::Record => Style::default().add_modifier(Modifier::REVERSED),
-            ByteKind::PageHeader => Style::default().fg(Color::DarkGray),
+    fn style_at(&self, offset: usize, overlay: &RecordOverlay) -> Style {
+        match self.classify(offset, overlay) {
+            ByteKind::PageHeader | ByteKind::Zero => theme::dim(),
             ByteKind::Plain => Style::default(),
+            ByteKind::Record(part) => {
+                let style = theme::record_part(part).add_modifier(theme::selected_record());
+                if overlay.focus.contains(&part) {
+                    style.patch(theme::cursor())
+                } else {
+                    style
+                }
+            }
         }
     }
 
-    /// One line of the dump, with runs of same-kind bytes merged into a span.
-    fn line(&self, line_idx: usize, record: &[Range<usize>]) -> Line<'static> {
+    /// The ASCII column dims its placeholders: a run of dots carries nothing,
+    /// and letting it recede makes the printable stretches stand out.
+    fn ascii_style_at(&self, offset: usize, overlay: &RecordOverlay) -> Style {
+        let printable = self
+            .bytes
+            .get(offset)
+            .is_some_and(|b| (0x20..0x7f).contains(b));
+        if printable {
+            self.style_at(offset, overlay)
+        } else {
+            match self.classify(offset, overlay) {
+                ByteKind::Record(_) => self.style_at(offset, overlay).patch(theme::dim()),
+                _ => theme::dim(),
+            }
+        }
+    }
+
+    /// One line of the dump, with runs of same-styled bytes merged into a span.
+    fn line(&self, line_idx: usize, overlay: &RecordOverlay) -> Line<'static> {
         let start = line_idx * self.bytes_per_line;
         let end = (start + self.bytes_per_line).min(self.bytes.len());
 
-        let mut spans = vec![Span::raw(format!(
-            "{:<10} {:08x}: ",
-            lsn_format(self.start_lsn + start as u64),
-            start
-        ))];
+        let mut spans = vec![Span::styled(
+            format!(
+                "{:<10} {:08x}: ",
+                lsn_format(self.start_lsn + start as u64),
+                start
+            ),
+            theme::hex_addr(),
+        )];
 
-        let flush = |spans: &mut Vec<Span<'static>>, text: &mut String, kind: ByteKind| {
+        let flush = |spans: &mut Vec<Span<'static>>, text: &mut String, style: Style| {
             if !text.is_empty() {
-                spans.push(Span::styled(std::mem::take(text), Self::style_for(kind)));
+                spans.push(Span::styled(std::mem::take(text), style));
             }
         };
 
@@ -737,13 +847,13 @@ impl HexDump<'_> {
         // highlighted from exactly the right byte.
         let mut hex = String::new();
         let mut hex_width = 0usize;
-        let mut run = self.classify(start, record);
+        let mut run = self.style_at(start, overlay);
         for offset in start..end {
-            let kind = self.classify(offset, record);
-            if kind != run {
+            let style = self.style_at(offset, overlay);
+            if style != run {
                 hex_width += hex.chars().count();
                 flush(&mut spans, &mut hex, run);
-                run = kind;
+                run = style;
             }
             let col = offset - start;
             if col > 0 {
@@ -763,12 +873,12 @@ impl HexDump<'_> {
 
         // ASCII column, highlighted the same way.
         let mut ascii = String::new();
-        let mut run = self.classify(start, record);
+        let mut run = self.ascii_style_at(start, overlay);
         for offset in start..end {
-            let kind = self.classify(offset, record);
-            if kind != run {
+            let style = self.ascii_style_at(offset, overlay);
+            if style != run {
                 flush(&mut spans, &mut ascii, run);
-                run = kind;
+                run = style;
             }
             let b = self.bytes[offset];
             ascii.push(if (0x20..0x7f).contains(&b) {
@@ -829,20 +939,20 @@ impl App {
 
         // The colour of the transaction's graph line is decided by how the
         // transaction ended, so it is looked up once for the whole pane.
-        let line_color = match self.xid_range {
+        let graph_style = match self.xid_range {
             Some((_, last)) if self.records.get(last).is_some() => {
                 let last_rec = &self.records[last];
                 if RmgrId::from_u8(last_rec.xlrec.xl_rmid) == RmgrId::Xact {
                     match XactOp::from_xl_info(last_rec.xlrec.xl_info) {
-                        XactOp::Commit | XactOp::CommitPrepared => Color::Cyan,
-                        XactOp::Abort | XactOp::AbortPrepared => Color::Red,
-                        _ => Color::Yellow,
+                        XactOp::Commit | XactOp::CommitPrepared => theme::graph_committed(),
+                        XactOp::Abort | XactOp::AbortPrepared => theme::graph_aborted(),
+                        _ => theme::graph_open(),
                     }
                 } else {
-                    Color::DarkGray
+                    theme::graph_none()
                 }
             }
-            _ => Color::DarkGray,
+            _ => theme::graph_none(),
         };
 
         let rows: Vec<Row> = window
@@ -868,12 +978,10 @@ impl App {
                     }
                 }
 
-                let graph_span = Span::styled(
-                    prefix,
-                    Style::default().fg(line_color).add_modifier(Modifier::BOLD),
-                );
-                let lsn_span = Span::raw(lsn_format(record.lsn));
-                let combined_line = Line::from(vec![graph_span, lsn_span]);
+                let combined_line = Line::from(vec![
+                    Span::styled(prefix, graph_style),
+                    Span::styled(lsn_format(record.lsn), theme::lsn()),
+                ]);
 
                 let desc = describe_record(record);
                 let desc_cell = if record.crc_ok {
@@ -881,37 +989,44 @@ impl App {
                 } else {
                     Cell::from(Span::styled(
                         format!("{} [CRC ERROR]", desc),
-                        Style::default().fg(Color::Red),
+                        theme::crc_bad(),
                     ))
                 };
 
+                // Full-page images are what make a segment large, so mark the
+                // records carrying one.  A character, not just a colour.
+                let has_fpi = record.blocks.iter().any(|b| b.image.is_some());
+                let fpi_cell = if has_fpi {
+                    Cell::from(Span::styled("*", theme::fpi_marker()))
+                } else {
+                    Cell::from(" ")
+                };
+
+                let rmgr = RmgrId::from_u8(record.xlrec.xl_rmid);
                 let mut row = Row::new(vec![
                     Cell::from(combined_line),
                     Cell::from(record.xlrec.xl_xid.to_string()),
                     Cell::from(record.xlrec.xl_tot_len.to_string()),
-                    Cell::from(RmgrId::from_u8(record.xlrec.xl_rmid).to_string()),
+                    fpi_cell,
+                    Cell::from(Span::styled(rmgr.to_string(), theme::rmgr(rmgr))),
                     desc_cell,
                 ]);
 
                 if is_selected {
-                    row = row.style(Style::default().add_modifier(Modifier::REVERSED));
+                    row = row.style(theme::selected_row());
                 } else if let Some(xid) = selected_xid
                     && xid != 0
                     && record.xlrec.xl_xid == xid
                 {
-                    row = row.style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                    row = row.style(theme::xid_group_row());
                 }
 
                 row
             })
             .collect();
 
-        let header = Row::new(vec!["       LSN", "XID", "LEN", "RMID", "DESC"])
-            .style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+        let header = Row::new(vec!["       LSN", "XID", "LEN", "F", "RMID", "DESC"])
+            .style(theme::list_header())
             .bottom_margin(1);
 
         // The fixed widths used to add up to more than the pane, so the
@@ -923,6 +1038,7 @@ impl App {
             Constraint::Length(17),
             Constraint::Length(9),
             Constraint::Length(8),
+            Constraint::Length(1),
             Constraint::Length(12),
             Constraint::Fill(1),
         ];
@@ -939,7 +1055,7 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(border_style(list_active))
+                    .border_style(theme::border(list_active))
                     .title(format!("WAL records ({})", self.records.len()))
                     .title_top(
                         Line::from(format!(
@@ -965,13 +1081,16 @@ impl App {
         StatefulWidget::render(table, area, buf, &mut window_state);
     }
 
-    fn render_details(&mut self, area: Rect, buf: &mut Buffer) {
+    /// Returns the record part the cursor is on, for the hex dump to pick out.
+    /// In auto-expand mode there is no cursor and so nothing is picked out.
+    fn render_details(&mut self, area: Rect, buf: &mut Buffer) -> Vec<RecordPart> {
         if area.width < 2 || area.height < 2 {
-            return;
+            return Vec::new();
         }
 
         let detail_active = self.focus == FocusPane::Details;
         let inner_h = area.height.saturating_sub(2) as usize;
+        let mut focus = Vec::new();
 
         let (detail_lines, cursor_line) = match self.records.get(self.state.selected().unwrap_or(0))
         {
@@ -984,6 +1103,7 @@ impl App {
                     self.detail_scroll = 0;
                     (full_lines, 0)
                 } else {
+                    focus = self.detail_tree.focused_parts(record);
                     build_detail_lines(&self.detail_tree, record, detail_active)
                 }
             }
@@ -1004,14 +1124,16 @@ impl App {
                 Block::default()
                     .title("DETAILS")
                     .borders(Borders::ALL)
-                    .border_style(border_style(detail_active))
+                    .border_style(theme::border(detail_active))
                     .merge_borders(MergeStrategy::Exact),
             )
             .scroll((self.detail_scroll as u16, 0))
             .render(area, buf);
+
+        focus
     }
 
-    fn render_hex_dump(&mut self, area: Rect, buf: &mut Buffer) {
+    fn render_hex_dump(&mut self, area: Rect, buf: &mut Buffer, focus: Vec<RecordPart>) {
         if area.width < 2 || area.height < 2 {
             return;
         }
@@ -1027,21 +1149,19 @@ impl App {
         };
         let total_lines = dump.total_lines();
 
-        let selected = self
-            .state
-            .selected()
-            .and_then(|i| self.records.get(i))
-            .map(|r| (r.lsn, r.file_ranges.clone()))
-            .unwrap_or((0, Vec::new()));
-        let (record_lsn, record_ranges) = selected;
+        let selected = self.state.selected().and_then(|i| self.records.get(i));
+        let record_lsn = selected.map_or(0, |r| r.lsn);
+        let overlay = match selected {
+            Some(r) => RecordOverlay::of(r, focus),
+            None => RecordOverlay::empty(),
+        };
 
         // Resolve a pending jump now that the geometry is known.
         match self.hex_jump {
             HexJump::ToSelection => {
-                if let Some(first) = record_ranges.first() {
+                if let Some(first) = overlay.first_byte() {
                     // Leave a little context above the record.
-                    self.hex_scroll =
-                        (first.start / dump.bytes_per_line).saturating_sub(HEX_JUMP_MARGIN);
+                    self.hex_scroll = (first / dump.bytes_per_line).saturating_sub(HEX_JUMP_MARGIN);
                 }
             }
             HexJump::ToEnd => self.hex_scroll = total_lines.saturating_sub(visible),
@@ -1053,10 +1173,10 @@ impl App {
         // Only the lines on screen are built; a 16MB segment is a million of
         // them.
         let lines: Vec<Line> = (self.hex_scroll..(self.hex_scroll + visible).min(total_lines))
-            .map(|i| dump.line(i, &record_ranges))
+            .map(|i| dump.line(i, &overlay))
             .collect();
 
-        let title = if record_ranges.is_empty() {
+        let title = if overlay.parts.is_empty() {
             "HEX DUMP".to_string()
         } else {
             format!("HEX DUMP  (record {})", lsn_format(record_lsn))
@@ -1067,7 +1187,7 @@ impl App {
                 Block::default()
                     .title(title)
                     .borders(Borders::ALL)
-                    .border_style(border_style(hex_active))
+                    .border_style(theme::border(hex_active))
                     .merge_borders(MergeStrategy::Exact),
             )
             .render(area, buf);
@@ -1081,11 +1201,11 @@ impl App {
         let line = match &self.stop_reason {
             Some(reason) => Line::from(Span::styled(
                 format!(" stopped: {}", reason),
-                Style::default().fg(Color::Red),
+                theme::status_error(),
             )),
             None => Line::from(Span::styled(
                 " q:quit  Tab:pane  j/k:move  g/G:top/bottom  s/r:next/prev same XID  Space/-:page",
-                Style::default().fg(Color::DarkGray),
+                theme::status_hint(),
             )),
         };
         Paragraph::new(line).render(area, buf);
@@ -1125,8 +1245,8 @@ impl Widget for &mut App {
             .split(h_chunks[1]);
 
         self.render_record_list(h_chunks[0], buf);
-        self.render_details(v_chunks[0], buf);
-        self.render_hex_dump(v_chunks[1], buf);
+        let focus = self.render_details(v_chunks[0], buf);
+        self.render_hex_dump(v_chunks[1], buf, focus);
         self.render_status(outer[1], buf);
     }
 }
@@ -1248,6 +1368,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use ratatui::layout::Rect;
+    use ratatui::style::Modifier;
 
     fn parse(args: &[&str]) -> Result<Command, String> {
         parse_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
@@ -1351,108 +1472,6 @@ mod tests {
         }
     }
 
-    fn test_dump(bytes: &[u8], bytes_per_line: usize) -> HexDump<'_> {
-        HexDump {
-            bytes,
-            start_lsn: 3 * 0x100000,
-            xlog_blcksz: 8192,
-            bytes_per_line,
-        }
-    }
-
-    /// The line has to hold "<lsn> <offset>: <hex>  <ascii>"; when the pane is
-    /// too narrow for 16 bytes it has to fall back rather than truncate.
-    #[test]
-    fn bytes_per_line_is_chosen_to_fit_the_pane() {
-        assert_eq!(hex_bytes_per_line(200), 16);
-        assert_eq!(hex_bytes_per_line(89), 16);
-        assert_eq!(hex_bytes_per_line(88), 8);
-        assert_eq!(hex_bytes_per_line(55), 8);
-        assert_eq!(hex_bytes_per_line(54), 4);
-        assert_eq!(hex_bytes_per_line(10), 4);
-    }
-
-    #[test]
-    fn a_hex_line_shows_both_the_lsn_and_the_file_offset() {
-        let seg = test_segment();
-        let dump = test_dump(&seg, 8);
-
-        // Line 1 starts at file offset 8.
-        assert_eq!(
-            line_text(&dump.line(1, &[])),
-            "0/00300008 00000008: 08 09 0a 0b  0c 0d 0e 0f  ........"
-        );
-        // Line 8 starts at offset 0x40, where the bytes are printable ASCII.
-        assert_eq!(
-            line_text(&dump.line(8, &[])),
-            "0/00300040 00000040: 40 41 42 43  44 45 46 47  @ABCDEFG"
-        );
-    }
-
-    #[test]
-    fn the_last_line_is_not_padded_with_phantom_bytes() {
-        let seg = vec![0xAAu8; 20];
-        let dump = test_dump(&seg, 8);
-        assert_eq!(dump.total_lines(), 3);
-        assert_eq!(
-            line_text(&dump.line(2, &[])),
-            "0/00300010 00000010: aa aa aa aa               ...."
-        );
-    }
-
-    #[test]
-    fn record_bytes_are_told_apart_from_page_headers_and_the_rest() {
-        let seg = test_segment();
-        let dump = test_dump(&seg, 16);
-        let record = vec![40..8192, 8192 + 24..8192 + 100];
-
-        // Page 0's long header, then the record, then untouched bytes.
-        assert_eq!(dump.classify(0, &record), ByteKind::PageHeader);
-        assert_eq!(dump.classify(39, &record), ByteKind::PageHeader);
-        assert_eq!(dump.classify(40, &record), ByteKind::Record);
-        assert_eq!(dump.classify(8191, &record), ByteKind::Record);
-
-        // The page header that splits the record must not look like part of it.
-        assert_eq!(dump.classify(8192, &record), ByteKind::PageHeader);
-        assert_eq!(dump.classify(8192 + 23, &record), ByteKind::PageHeader);
-        assert_eq!(dump.classify(8192 + 24, &record), ByteKind::Record);
-        assert_eq!(dump.classify(8192 + 99, &record), ByteKind::Record);
-        assert_eq!(dump.classify(8192 + 100, &record), ByteKind::Plain);
-
-        // A later page's header is dimmed even with no record near it.
-        assert_eq!(dump.classify(2 * 8192 + 10, &record), ByteKind::PageHeader);
-        assert_eq!(dump.classify(2 * 8192 + 24, &record), ByteKind::Plain);
-
-        // Page header always wins: a range that runs straight across a page
-        // boundary must not make the header look like record content.
-        let spanning = one_range(8100, 200);
-        assert_eq!(dump.classify(8191, &spanning), ByteKind::Record);
-        assert_eq!(dump.classify(8192, &spanning), ByteKind::PageHeader);
-        assert_eq!(dump.classify(8192 + 23, &spanning), ByteKind::PageHeader);
-        assert_eq!(dump.classify(8192 + 24, &spanning), ByteKind::Record);
-    }
-
-    #[test]
-    fn only_the_record_bytes_on_a_line_are_highlighted() {
-        let seg = test_segment();
-        let dump = test_dump(&seg, 16);
-        // A record starting mid-line, at offset 0x44.
-        let mark = one_range(0x44, 12);
-        let line = dump.line(4, &mark);
-
-        let highlighted: String = line
-            .spans
-            .iter()
-            .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
-            .map(|s| s.content.as_ref())
-            .collect();
-        // Bytes 0x40-0x43 stay plain; 0x44 onwards are highlighted, in the
-        // hex column and in the ASCII column alike.
-        assert!(highlighted.contains("44 45 46 47"), "{:?}", highlighted);
-        assert!(!highlighted.contains("40 41"), "{:?}", highlighted);
-        assert!(highlighted.contains("DEFGHIJKLMNO"), "{:?}", highlighted);
-    }
-
     fn record(lsn: XLogRecPtr, xid: TransactionId, rmid: u8) -> WALRecordInfo {
         let mut r = WALRecordInfo {
             lsn,
@@ -1484,8 +1503,330 @@ mod tests {
         buf
     }
 
-    /// A segment with nothing decodable used to index records[0] on the very
-    /// first frame and take the whole program down.
+    fn test_dump(bytes: &[u8], bytes_per_line: usize) -> HexDump<'_> {
+        HexDump {
+            bytes,
+            start_lsn: 3 * 0x100000,
+            xlog_blcksz: 8192,
+            bytes_per_line,
+        }
+    }
+
+    /// The line has to hold "<lsn> <offset>: <hex>  <ascii>"; when the pane is
+    /// too narrow for 16 bytes it has to fall back rather than truncate.
+    #[test]
+    fn bytes_per_line_is_chosen_to_fit_the_pane() {
+        assert_eq!(hex_bytes_per_line(200), 16);
+        assert_eq!(hex_bytes_per_line(89), 16);
+        assert_eq!(hex_bytes_per_line(88), 8);
+        assert_eq!(hex_bytes_per_line(55), 8);
+        assert_eq!(hex_bytes_per_line(54), 4);
+        assert_eq!(hex_bytes_per_line(10), 4);
+    }
+
+    #[test]
+    fn a_hex_line_shows_both_the_lsn_and_the_file_offset() {
+        let seg = test_segment();
+        let dump = test_dump(&seg, 8);
+
+        // Line 1 starts at file offset 8.
+        assert_eq!(
+            line_text(&dump.line(1, &RecordOverlay::empty())),
+            "0/00300008 00000008: 08 09 0a 0b  0c 0d 0e 0f  ........"
+        );
+        // Line 8 starts at offset 0x40, where the bytes are printable ASCII.
+        assert_eq!(
+            line_text(&dump.line(8, &RecordOverlay::empty())),
+            "0/00300040 00000040: 40 41 42 43  44 45 46 47  @ABCDEFG"
+        );
+    }
+
+    #[test]
+    fn the_last_line_is_not_padded_with_phantom_bytes() {
+        let seg = vec![0xAAu8; 20];
+        let dump = test_dump(&seg, 8);
+        assert_eq!(dump.total_lines(), 3);
+        assert_eq!(
+            line_text(&dump.line(2, &RecordOverlay::empty())),
+            "0/00300010 00000010: aa aa aa aa               ...."
+        );
+    }
+
+    /// A record whose parts land at known offsets in the test segment.
+    fn structured_record() -> WALRecordInfo {
+        let mut rec = record(0x1000000 + MARK_AT as u64, 5, 10);
+        rec.xlrec.xl_tot_len = 60;
+        rec.raw = vec![0u8; 60];
+        rec.file_ranges = one_range(MARK_AT, 60);
+        rec.main_range = Some(40..60);
+        rec.blocks = vec![WALBlockData {
+            block_id: 0,
+            flags: BKPBLOCK_HAS_DATA,
+            data_len: 10,
+            data_range: Some(30..40),
+            ..Default::default()
+        }];
+        rec
+    }
+
+    /// parts(): Header 0..24, Descriptors 24..30, BlockData 30..40, Main 40..60
+    /// -- offset by MARK_AT once mapped onto the file.
+    #[test]
+    fn the_dump_colours_each_part_of_the_record() {
+        let rec = structured_record();
+        let seg = test_segment();
+        let dump = test_dump(&seg, 16);
+        let overlay = RecordOverlay::of(&rec, vec![]);
+
+        assert_eq!(
+            dump.classify(MARK_AT, &overlay),
+            ByteKind::Record(RecordPart::Header)
+        );
+        assert_eq!(
+            dump.classify(MARK_AT + 23, &overlay),
+            ByteKind::Record(RecordPart::Header)
+        );
+        assert_eq!(
+            dump.classify(MARK_AT + 24, &overlay),
+            ByteKind::Record(RecordPart::Descriptors)
+        );
+        assert_eq!(
+            dump.classify(MARK_AT + 30, &overlay),
+            ByteKind::Record(RecordPart::BlockData(0))
+        );
+        assert_eq!(
+            dump.classify(MARK_AT + 40, &overlay),
+            ByteKind::Record(RecordPart::MainData)
+        );
+        assert_eq!(
+            dump.classify(MARK_AT + 59, &overlay),
+            ByteKind::Record(RecordPart::MainData)
+        );
+        // One past the end is no longer the record.
+        assert_ne!(
+            dump.classify(MARK_AT + 60, &overlay),
+            ByteKind::Record(RecordPart::MainData)
+        );
+    }
+
+    /// Zero bytes are dimmed to let the structure show, but only outside the
+    /// record: a zero inside it is as meaningful as any other byte.
+    #[test]
+    fn zero_bytes_are_dimmed_only_outside_the_record() {
+        let rec = structured_record();
+        let mut seg = test_segment();
+        seg[MARK_AT + 5] = 0; // inside the record header
+        seg[MARK_AT + 200] = 0; // well past it
+        seg[MARK_AT + 201] = 0x42;
+        let dump = test_dump(&seg, 16);
+        let overlay = RecordOverlay::of(&rec, vec![]);
+
+        assert_eq!(
+            dump.classify(MARK_AT + 5, &overlay),
+            ByteKind::Record(RecordPart::Header)
+        );
+        assert_eq!(dump.classify(MARK_AT + 200, &overlay), ByteKind::Zero);
+        assert_eq!(dump.classify(MARK_AT + 201, &overlay), ByteKind::Plain);
+    }
+
+    #[test]
+    fn the_selected_record_is_bold_and_the_focused_part_is_reversed() {
+        let rec = structured_record();
+        let seg = test_segment();
+        let dump = test_dump(&seg, 16);
+        let overlay = RecordOverlay::of(&rec, vec![RecordPart::BlockData(0)]);
+
+        let header = dump.style_at(MARK_AT, &overlay);
+        assert!(header.add_modifier.contains(Modifier::BOLD));
+        assert!(!header.add_modifier.contains(Modifier::REVERSED));
+
+        let focused = dump.style_at(MARK_AT + 30, &overlay);
+        assert!(focused.add_modifier.contains(Modifier::BOLD));
+        assert!(focused.add_modifier.contains(Modifier::REVERSED));
+
+        let outside = dump.style_at(MARK_AT + 200, &overlay);
+        assert!(!outside.add_modifier.contains(Modifier::BOLD));
+
+        // Different parts get different colours.
+        assert_ne!(header.fg, dump.style_at(MARK_AT + 40, &overlay).fg);
+    }
+
+    /// The DETAILS cursor drives the emphasis in the dump.
+    #[test]
+    fn the_details_cursor_selects_the_focused_parts() {
+        let rec = structured_record();
+        let mut tree = DetailTree::new_for(&rec);
+        assert_eq!(tree.focused_parts(&rec), vec![RecordPart::Header]);
+
+        // A block item covers everything belonging to that block, so a block
+        // whose only payload is a full-page image still lights up.
+        tree.move_down(&rec.blocks, rec.has_main_data());
+        assert_eq!(
+            tree.focused_parts(&rec),
+            vec![RecordPart::Fpi(0), RecordPart::BlockData(0)]
+        );
+
+        tree.move_down(&rec.blocks, rec.has_main_data());
+        assert_eq!(tree.focused_parts(&rec), vec![RecordPart::MainData]);
+    }
+
+    /// Selecting a block that carries only an image used to highlight nothing:
+    /// the block item mapped onto BlockData, which such a block does not have.
+    #[test]
+    fn a_block_holding_only_an_image_is_highlighted() {
+        let mut rec = record(0x1000000 + MARK_AT as u64, 5, 10);
+        rec.xlrec.xl_tot_len = 60;
+        rec.raw = vec![0u8; 60];
+        rec.file_ranges = one_range(MARK_AT, 60);
+        rec.blocks = vec![WALBlockData {
+            flags: BKPBLOCK_HAS_IMAGE,
+            image: Some(WALFullPageImage {
+                bimg_len: 30,
+                bimg_range: 30..60,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+
+        let mut tree = DetailTree::new_for(&rec);
+        tree.move_down(&rec.blocks, rec.has_main_data());
+        let overlay = RecordOverlay::of(&rec, tree.focused_parts(&rec));
+
+        let seg = test_segment();
+        let dump = test_dump(&seg, 16);
+        assert!(
+            dump.style_at(MARK_AT + 30, &overlay)
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    /// Splitting on the first colon only: a timestamp value has colons of its
+    /// own and must stay in one piece.
+    #[test]
+    fn detail_lines_split_the_key_from_the_value() {
+        let line = detail_field_line("  ts:  2000-01-01 00:00:00 UTC".to_string());
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[0].content, "  ts:");
+        assert_eq!(line.spans[1].content, "  2000-01-01 00:00:00 UTC");
+        assert_ne!(line.spans[0].style, line.spans[1].style);
+
+        // A line with no key is all value.
+        let line = detail_field_line("  (no main data)".to_string());
+        assert_eq!(line.spans.len(), 1);
+        assert_eq!(line.spans[0].content, "  (no main data)");
+    }
+
+    #[test]
+    fn the_list_marks_records_that_carry_a_full_page_image() {
+        let mut plain = record(0x1000000, 5, 10);
+        plain.blocks = vec![WALBlockData::default()];
+        let mut with_fpi = record(0x1000020, 5, 10);
+        with_fpi.blocks = vec![WALBlockData {
+            image: Some(Default::default()),
+            ..Default::default()
+        }];
+
+        let mut app = App::with_records(
+            PathBuf::from("seg"),
+            vec![plain, with_fpi],
+            None,
+            test_seg(),
+        );
+        let buf = render(&mut app, Rect::new(0, 0, 150, 45));
+        let text = screen_text(&buf);
+        // The header names the column, and exactly one row is marked.
+        assert!(text.contains(" F "), "{}", &text[..200]);
+        assert_eq!(
+            text.lines().filter(|l| l.contains(" * ")).count(),
+            1,
+            "{}",
+            text
+        );
+    }
+
+    fn overlay(parts: Vec<(Range<usize>, RecordPart)>, focus: Vec<RecordPart>) -> RecordOverlay {
+        RecordOverlay { parts, focus }
+    }
+
+    #[test]
+    fn record_bytes_are_told_apart_from_page_headers_and_the_rest() {
+        let seg = test_segment();
+        let dump = test_dump(&seg, 16);
+        let record = overlay(
+            vec![
+                (40..8192, RecordPart::Fpi(0)),
+                (8192 + 24..8192 + 100, RecordPart::Fpi(0)),
+            ],
+            vec![],
+        );
+
+        // Page 0's long header, then the record, then untouched bytes.
+        assert_eq!(dump.classify(0, &record), ByteKind::PageHeader);
+        assert_eq!(dump.classify(39, &record), ByteKind::PageHeader);
+        assert_eq!(
+            dump.classify(40, &record),
+            ByteKind::Record(RecordPart::Fpi(0))
+        );
+        assert_eq!(
+            dump.classify(8191, &record),
+            ByteKind::Record(RecordPart::Fpi(0))
+        );
+
+        // The page header that splits the record must not look like part of it.
+        assert_eq!(dump.classify(8192, &record), ByteKind::PageHeader);
+        assert_eq!(dump.classify(8192 + 23, &record), ByteKind::PageHeader);
+        assert_eq!(
+            dump.classify(8192 + 24, &record),
+            ByteKind::Record(RecordPart::Fpi(0))
+        );
+        assert_ne!(
+            dump.classify(8192 + 100, &record),
+            ByteKind::Record(RecordPart::Fpi(0))
+        );
+
+        // A later page's header is dimmed even with no record near it.
+        assert_eq!(dump.classify(2 * 8192 + 10, &record), ByteKind::PageHeader);
+        assert_ne!(dump.classify(2 * 8192 + 24, &record), ByteKind::PageHeader);
+
+        // Page header always wins: a range that runs straight across a page
+        // boundary must not make the header look like record content.
+        let spanning = overlay(vec![(8100..8300, RecordPart::MainData)], vec![]);
+        assert_eq!(
+            dump.classify(8191, &spanning),
+            ByteKind::Record(RecordPart::MainData)
+        );
+        assert_eq!(dump.classify(8192, &spanning), ByteKind::PageHeader);
+        assert_eq!(dump.classify(8192 + 23, &spanning), ByteKind::PageHeader);
+        assert_eq!(
+            dump.classify(8192 + 24, &spanning),
+            ByteKind::Record(RecordPart::MainData)
+        );
+    }
+
+    #[test]
+    fn only_the_record_bytes_on_a_line_are_highlighted() {
+        let seg = test_segment();
+        let dump = test_dump(&seg, 16);
+        // A record starting mid-line, at offset 0x44, with the cursor on it.
+        let mark = overlay(
+            vec![(0x44..0x50, RecordPart::MainData)],
+            vec![RecordPart::MainData],
+        );
+        let line = dump.line(4, &mark);
+
+        let highlighted: String = line
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        // Bytes 0x40-0x43 stay plain; 0x44 onwards are highlighted, in the
+        // hex column and in the ASCII column alike.
+        assert!(highlighted.contains("44 45 46 47"), "{:?}", highlighted);
+        assert!(!highlighted.contains("40 41"), "{:?}", highlighted);
+        assert!(highlighted.contains("DEFGHIJKLMNO"), "{:?}", highlighted);
+    }
     #[test]
     fn an_empty_record_list_renders() {
         let mut app = App::with_records(PathBuf::from("seg"), vec![], None, test_seg());

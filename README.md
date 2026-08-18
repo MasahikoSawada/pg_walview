@@ -8,7 +8,7 @@ A modernized, interactive TUI alternative to `pg_waldump` for exploring PostgreS
 
 - Visual Transaction Tracking: Visually track `COMMIT`s and `ABORT`s with colored, dynamically drawn graph lines.
 - Deep Drill-down: Detail split view. Inspect `XLogRecord` details, block-level information (`RelFileNode`), and Full Page Images (FPI) instantly.
-- Whole-segment hex dump with the selected record highlighted in place, addressed by LSN and file offset.
+- Whole-segment hex dump with the selected record coloured by structure in place, addressed by LSN and file offset.
 - Record checksums are verified (`xl_crc`), and a record that fails is flagged in the list and in the detail pane.
 - The segment a server is currently writing can be opened; reading stops at the point the WAL has been written up to.
 
@@ -83,12 +83,26 @@ In the DETAILS pane:
 | `↑` / `↓` | Move the cursor between items              |
 | `Enter`    | Expand / collapse the item under the cursor |
 
-The HEX DUMP pane dumps the whole WAL segment, with the bytes of the selected
-record highlighted and WAL page headers dimmed, so a record can be read in the
-context of the pages it lives on. Each line is addressed by both LSN and file
-offset. A record that crosses a page boundary is highlighted in the two (or
-more) pieces it actually occupies in the file; the page header that splits it
-is not.
+The HEX DUMP pane dumps the whole WAL segment, addressing each line by both LSN
+and file offset, so a record can be read in the context of the pages it lives
+on. The bytes of the selected record are coloured by what they are — the
+`XLogRecord` header, the descriptors, a full-page image, block data, main data —
+while page headers and zero bytes elsewhere recede. A record that crosses a page
+boundary is coloured in the two (or more) pieces it actually occupies in the
+file; the page header that splits it is not part of the record and is not
+coloured as one.
+
+Whatever the DETAILS cursor is on is picked out in the dump, so the accordion
+doubles as a navigator over the bytes.
+
+In the record list, resource managers are coloured by family (heap, index,
+transaction, system), and the `F` column marks the records carrying a full-page
+image — the records that account for most of a segment's size.
+
+Only the 16 ANSI colours are used, so the terminal's own theme still decides
+what they look like. Setting `NO_COLOR` to a non-empty value turns the colours
+off; bold and reverse video stay, since they are not colour and without them
+there would be no way to see what is selected.
 
 | Key        | Action                                    |
 |------------|-------------------------------------------|

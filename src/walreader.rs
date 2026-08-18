@@ -170,9 +170,83 @@ pub struct WALRecordInfo {
     pub raw: Vec<u8>,
 }
 
+/// The pieces a WAL record is made of, in the order they appear on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordPart {
+    /// The fixed XLogRecord header.
+    Header,
+    /// Block references, replication origin, top-level XID and the main-data
+    /// header -- everything that describes the payloads that follow.
+    Descriptors,
+    /// The full-page image of the given block.
+    Fpi(usize),
+    /// The rmgr-specific data of the given block.
+    BlockData(usize),
+    /// The record's main data.
+    MainData,
+}
+
 impl WALRecordInfo {
     pub fn nblocks_inuse(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Split the record into its parts, as ranges of `raw`.  Contiguous and
+    /// gap-free: the descriptors run from the end of the header to wherever
+    /// the first payload starts, so nothing is left unaccounted for.
+    pub fn parts(&self) -> Vec<(Range<usize>, RecordPart)> {
+        let mut payloads: Vec<(Range<usize>, RecordPart)> = Vec::new();
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            if let Some(image) = &block.image {
+                payloads.push((image.bimg_range.clone(), RecordPart::Fpi(i)));
+            }
+            if let Some(data) = &block.data_range {
+                payloads.push((data.clone(), RecordPart::BlockData(i)));
+            }
+        }
+        if let Some(main) = &self.main_range {
+            payloads.push((main.clone(), RecordPart::MainData));
+        }
+        payloads.retain(|(r, _)| !r.is_empty());
+
+        let descriptors_end = payloads
+            .first()
+            .map(|(r, _)| r.start)
+            .unwrap_or(self.xlrec.xl_tot_len as usize);
+
+        let mut parts = vec![(0..SIZE_OF_XLOG_RECORD, RecordPart::Header)];
+        if descriptors_end > SIZE_OF_XLOG_RECORD {
+            parts.push((
+                SIZE_OF_XLOG_RECORD..descriptors_end,
+                RecordPart::Descriptors,
+            ));
+        }
+        parts.extend(payloads);
+        parts
+    }
+
+    /// Map a range of `raw` onto the ranges of the file those bytes occupy.
+    /// The two differ because a page header splits a record that crosses a
+    /// page boundary.
+    pub fn file_ranges_of(&self, raw: Range<usize>) -> Vec<Range<usize>> {
+        let mut out = Vec::new();
+        let mut consumed = 0usize; // how much of `raw` the ranges so far covered
+
+        for file in &self.file_ranges {
+            let piece_start = consumed;
+            let piece_end = consumed + file.len();
+            consumed = piece_end;
+
+            let start = raw.start.max(piece_start);
+            let end = raw.end.min(piece_end);
+            if start >= end {
+                continue;
+            }
+            out.push(file.start + (start - piece_start)..file.start + (end - piece_start));
+        }
+
+        out
     }
 
     pub fn main_data(&self) -> Option<&[u8]> {
@@ -1397,6 +1471,125 @@ mod tests {
         assert_eq!(rec.file_ranges.len(), 1);
         assert_eq!(rec.file_ranges.capacity(), rec.file_ranges.len());
         assert_eq!(rec.raw.capacity(), rec.raw.len());
+    }
+
+    /// The hex dump colours a record by what each byte is, so the decoder has
+    /// to be able to say which range is which part.
+    #[test]
+    fn parts_cover_the_record_exactly_and_in_order() {
+        let mut body = vec![0u8, BKPBLOCK_HAS_IMAGE | BKPBLOCK_HAS_DATA];
+        body.extend_from_slice(&3u16.to_le_bytes()); // data_len
+        body.extend_from_slice(&8192u16.to_le_bytes()); // bimg_len
+        body.extend_from_slice(&0u16.to_le_bytes()); // hole_offset
+        body.push(BKPIMAGE_APPLY); // bimg_info
+        body.extend_from_slice(&1663u32.to_le_bytes());
+        body.extend_from_slice(&5u32.to_le_bytes());
+        body.extend_from_slice(&16384u32.to_le_bytes());
+        body.extend_from_slice(&7u32.to_le_bytes()); // blocknum
+        body.push(XLR_BLOCK_ID_DATA_SHORT);
+        body.push(2);
+        let descriptors_len = body.len();
+        body.extend(std::iter::repeat_n(0xAAu8, 8192)); // the image
+        body.extend_from_slice(b"\x01\x02\x03"); // block data
+        body.extend_from_slice(b"\xEE\xFF"); // main data
+
+        let mut reader =
+            reader_for(build_segment(SEG_NO, &[make_record(7, 10, 0, &body)])).unwrap();
+        let (got, err) = read_all(&mut reader);
+        assert!(err.is_none(), "unexpected error: {:?}", err);
+
+        let rec = &got[0];
+        let h = SIZE_OF_XLOG_RECORD;
+        assert_eq!(
+            rec.parts(),
+            vec![
+                (0..h, RecordPart::Header),
+                (h..h + descriptors_len, RecordPart::Descriptors),
+                (
+                    h + descriptors_len..h + descriptors_len + 8192,
+                    RecordPart::Fpi(0)
+                ),
+                (
+                    h + descriptors_len + 8192..h + descriptors_len + 8195,
+                    RecordPart::BlockData(0)
+                ),
+                (
+                    h + descriptors_len + 8195..h + descriptors_len + 8197,
+                    RecordPart::MainData
+                ),
+            ]
+        );
+
+        // No gaps, no overlaps, and the whole record is accounted for.
+        let parts = rec.parts();
+        assert_eq!(parts[0].0.start, 0);
+        assert_eq!(parts.last().unwrap().0.end, rec.xlrec.xl_tot_len as usize);
+        for pair in parts.windows(2) {
+            assert_eq!(pair[0].0.end, pair[1].0.start);
+        }
+    }
+
+    /// A record with no payload at all is still made of a header followed by
+    /// its descriptors.
+    #[test]
+    fn parts_of_a_payload_free_record() {
+        let mut body = vec![0u8, 0u8]; // block 0, main fork, no data, no image
+        body.extend_from_slice(&0u16.to_le_bytes());
+        body.extend_from_slice(&[0u8; 12]);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        let len = body.len();
+
+        let mut reader =
+            reader_for(build_segment(SEG_NO, &[make_record(7, 10, 0, &body)])).unwrap();
+        let (got, _) = read_all(&mut reader);
+        assert_eq!(
+            got[0].parts(),
+            vec![
+                (0..SIZE_OF_XLOG_RECORD, RecordPart::Header),
+                (
+                    SIZE_OF_XLOG_RECORD..SIZE_OF_XLOG_RECORD + len,
+                    RecordPart::Descriptors
+                ),
+            ]
+        );
+    }
+
+    /// The dump addresses the file, the parts address `raw`, so one has to be
+    /// mapped onto the other -- and a part that straddles a page boundary
+    /// comes out as two file ranges.
+    #[test]
+    fn raw_ranges_map_onto_file_ranges() {
+        let payload_len = BLK + 1000;
+        let mut body = vec![XLR_BLOCK_ID_DATA_LONG];
+        body.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        body.extend((0..payload_len).map(|i| i as u8));
+        let rec = make_record(100, 10, 0, &body);
+        let total = rec.len();
+
+        let mut reader = reader_for(build_segment(SEG_NO, &[rec])).unwrap();
+        let (got, _) = read_all(&mut reader);
+        let rec = &got[0];
+        assert_eq!(rec.file_ranges.len(), 2);
+
+        // The header sits entirely on the first page.
+        assert_eq!(
+            rec.file_ranges_of(0..SIZE_OF_XLOG_RECORD),
+            vec![40..40 + SIZE_OF_XLOG_RECORD]
+        );
+        // The whole record maps back to exactly the file ranges it came from.
+        assert_eq!(rec.file_ranges_of(0..total), rec.file_ranges);
+
+        // The main data straddles the page boundary.
+        let (main, part) = rec.parts().last().unwrap().clone();
+        assert_eq!(part, RecordPart::MainData);
+        let mapped = rec.file_ranges_of(main.clone());
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0].end, BLK);
+        assert_eq!(mapped[1].start, BLK + 24);
+        assert_eq!(mapped.iter().map(|r| r.len()).sum::<usize>(), main.len());
+
+        // An empty range maps to nothing rather than to a stray byte.
+        assert!(rec.file_ranges_of(10..10).is_empty());
     }
 
     #[test]
