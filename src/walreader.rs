@@ -681,6 +681,12 @@ impl<R: Read + Seek> WALReader<R> {
         record.crc_ok = verify_record_crc(&self.record_buffer);
         record.file_ranges = file_ranges;
 
+        // Every record is held for the lifetime of the program, so the spare
+        // capacity a grown Vec leaves behind is paid once per record: a Vec of
+        // one element otherwise reserves room for four.
+        record.file_ranges.shrink_to_fit();
+        record.blocks.shrink_to_fit();
+
         if !record.crc_ok {
             // Past a bad CRC nothing in the stream can be trusted, in
             // particular not the next record's xl_tot_len.  Hand back this
@@ -1359,6 +1365,32 @@ mod tests {
         // The ranges cover the record exactly once.
         let covered: usize = got[0].file_ranges.iter().map(|r| r.len()).sum();
         assert_eq!(covered, total);
+    }
+
+    /// Every record is kept for the lifetime of the program, so the slack a
+    /// growing Vec leaves behind is multiplied by the record count -- a Vec of
+    /// one element otherwise reserves room for four.
+    #[test]
+    fn records_do_not_carry_spare_capacity() {
+        let mut body = vec![0u8, BKPBLOCK_HAS_DATA];
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&[0u8; 12]); // rlocator
+        body.extend_from_slice(&0u32.to_le_bytes()); // blocknum
+        body.push(XLR_BLOCK_ID_DATA_SHORT);
+        body.push(1);
+        body.extend_from_slice(b"\x01\x02");
+
+        let mut reader =
+            reader_for(build_segment(SEG_NO, &[make_record(7, 10, 0, &body)])).unwrap();
+        let (got, err) = read_all(&mut reader);
+        assert!(err.is_none(), "unexpected error: {:?}", err);
+
+        let rec = &got[0];
+        assert_eq!(rec.blocks.len(), 1);
+        assert_eq!(rec.blocks.capacity(), rec.blocks.len());
+        assert_eq!(rec.file_ranges.len(), 1);
+        assert_eq!(rec.file_ranges.capacity(), rec.file_ranges.len());
+        assert_eq!(rec.raw.capacity(), rec.raw.len());
     }
 
     #[test]
