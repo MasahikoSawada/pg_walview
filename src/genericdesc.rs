@@ -12,15 +12,19 @@ pub struct GenericOp {
 
 impl GenericOp {
     pub fn from_xl_info(info: u8) -> Self {
-	GenericOp {
-	    page_count: info & 0x0F,
-	}
+        GenericOp {
+            page_count: info & 0x0F,
+        }
     }
 }
 
 impl fmt::Display for GenericOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-	write!(f, "MODIFY({} page{})", self.page_count,
-	       if self.page_count == 1 { "" } else { "s" })
+        write!(
+            f,
+            "MODIFY({} page{})",
+            self.page_count,
+            if self.page_count == 1 { "" } else { "s" }
+        )
     }
 }

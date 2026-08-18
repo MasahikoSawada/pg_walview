@@ -6,18 +6,22 @@ use std::process::Command;
 
 fn get_pg_include_dir() -> String {
     if let Ok(path) = env::var("PG_INCLUDE_DIR") {
-	return path;
+        return path;
     }
 
-    if let Ok(output) = Command::new("pg_config").arg("--includedir-server").output() {
-	if output.status.success() {
-	    if let Ok(path) = String::from_utf8(output.stdout) {
-		return path.trim().to_string();
-	    }
-	}
+    if let Ok(output) = Command::new("pg_config")
+        .arg("--includedir-server")
+        .output()
+        && output.status.success()
+        && let Ok(path) = String::from_utf8(output.stdout)
+    {
+        return path.trim().to_string();
     }
 
-    panic!("could not find include directory");
+    panic!(
+        "could not find the PostgreSQL server include directory; \
+         set PG_INCLUDE_DIR or put pg_config in PATH"
+    );
 }
 
 fn main() {
@@ -42,11 +46,13 @@ fn main() {
         .allowlist_type("ForkNumber")
         .allowlist_var("InvalidBlockNumber")
         .allowlist_var("XLOG_PAGE_MAGIC")
+        .allowlist_var("BLCKSZ")
+        .allowlist_var("XLOG_BLCKSZ")
         .generate()
         .expect("Unable to generate bindings");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
         .write_to_file(out_path.join("bindings.rs"))
-        .expect("coudl not write bindings!");
+        .expect("could not write bindings");
 }

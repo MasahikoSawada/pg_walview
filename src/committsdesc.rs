@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::walmisc::{fmt_pg_ts, Reader};
+use crate::walmisc::{Reader, fmt_pg_ts};
 use crate::walreader::XLR_RMGR_INFO_MASK;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,21 +12,21 @@ pub enum CommitTsOp {
 
 impl CommitTsOp {
     pub fn from_xl_info(info: u8) -> Self {
-	match info & XLR_RMGR_INFO_MASK {
-	    0x00 => CommitTsOp::ZeroPage,
-	    0x10 => CommitTsOp::Truncate,
-	    _ => CommitTsOp::Unknown,
-	}
+        match info & XLR_RMGR_INFO_MASK {
+            0x00 => CommitTsOp::ZeroPage,
+            0x10 => CommitTsOp::Truncate,
+            _ => CommitTsOp::Unknown,
+        }
     }
 }
 
 impl fmt::Display for CommitTsOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-	match self {
-	    CommitTsOp::ZeroPage => write!(f, "ZEROPAGE"),
-	    CommitTsOp::Truncate => write!(f, "TRUNCATE"),
-	    CommitTsOp::Unknown => write!(f, "Unknown"),
-	}
+        match self {
+            CommitTsOp::ZeroPage => write!(f, "ZEROPAGE"),
+            CommitTsOp::Truncate => write!(f, "TRUNCATE"),
+            CommitTsOp::Unknown => write!(f, "Unknown"),
+        }
     }
 }
 
@@ -38,8 +38,8 @@ pub fn describe_commit_ts_main(info: u8, main: &[u8]) -> Vec<String> {
     match op {
         CommitTsOp::ZeroPage => {
             if main.len() >= 14 {
-                let ts      = r.read_i64_le().unwrap_or(0);
-                let nodeid  = r.read_u16_le().unwrap_or(0);
+                let ts = r.read_i64_le().unwrap_or(0);
+                let nodeid = r.read_u16_le().unwrap_or(0);
                 r.skip(2);
                 let mainxid = r.read_u32_le().unwrap_or(0);
                 lines.push(format!("  timestamp: {} µs  ({})", ts, fmt_pg_ts(ts)));
@@ -54,7 +54,7 @@ pub fn describe_commit_ts_main(info: u8, main: &[u8]) -> Vec<String> {
             }
         }
         CommitTsOp::Truncate => {
-            let pageno     = r.read_i64_le().unwrap_or(0);
+            let pageno = r.read_i64_le().unwrap_or(0);
             let oldest_xid = r.read_u32_le().unwrap_or(0);
             lines.push(format!("  pageno:    {}", pageno));
             lines.push(format!("  oldestXid: {}", oldest_xid));

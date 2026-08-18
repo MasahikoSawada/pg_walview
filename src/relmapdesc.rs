@@ -11,19 +11,19 @@ pub enum RelmapOp {
 
 impl RelmapOp {
     pub fn from_xl_info(info: u8) -> Self {
-	match info & XLR_RMGR_INFO_MASK {
-	    0x00 => RelmapOp::Update,
-	    _ => RelmapOp::Unknown,
-	}
+        match info & XLR_RMGR_INFO_MASK {
+            0x00 => RelmapOp::Update,
+            _ => RelmapOp::Unknown,
+        }
     }
 }
 
 impl fmt::Display for RelmapOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-	match self {
-	    RelmapOp::Update => write!(f, "UPDATE"),
-	    RelmapOp::Unknown => write!(f, "Unknown"),
-	}
+        match self {
+            RelmapOp::Update => write!(f, "UPDATE"),
+            RelmapOp::Unknown => write!(f, "Unknown"),
+        }
     }
 }
 
@@ -34,8 +34,8 @@ pub fn describe_relmap_main(info: u8, main: &[u8]) -> Vec<String> {
 
     match op {
         RelmapOp::Update => {
-            let dbid   = r.read_u32_le().unwrap_or(0);
-            let tsid   = r.read_u32_le().unwrap_or(0);
+            let dbid = r.read_u32_le().unwrap_or(0);
+            let tsid = r.read_u32_le().unwrap_or(0);
             let nbytes = r.read_i32_le().unwrap_or(0);
             lines.push(format!("  dbid:   {}", dbid));
             lines.push(format!("  tsid:   {}", tsid));

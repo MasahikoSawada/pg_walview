@@ -11,19 +11,19 @@ pub enum LogicalMsgOp {
 
 impl LogicalMsgOp {
     pub fn from_xl_info(info: u8) -> Self {
-	match info & XLR_RMGR_INFO_MASK {
-	    0x00 => LogicalMsgOp::Message,
-	    _ => LogicalMsgOp::Unknown,
-	}
+        match info & XLR_RMGR_INFO_MASK {
+            0x00 => LogicalMsgOp::Message,
+            _ => LogicalMsgOp::Unknown,
+        }
     }
 }
 
 impl fmt::Display for LogicalMsgOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-	match self {
-	    LogicalMsgOp::Message => write!(f, "MESSAGE"),
-	    LogicalMsgOp::Unknown => write!(f, "Unknown"),
-	}
+        match self {
+            LogicalMsgOp::Message => write!(f, "MESSAGE"),
+            LogicalMsgOp::Unknown => write!(f, "Unknown"),
+        }
     }
 }
 
@@ -34,10 +34,10 @@ pub fn describe_logical_msg_main(info: u8, main: &[u8]) -> Vec<String> {
 
     match op {
         LogicalMsgOp::Message => {
-            let db_id         = r.read_u32_le().unwrap_or(0);
+            let db_id = r.read_u32_le().unwrap_or(0);
             let transactional = r.read_bool().unwrap_or(false);
             r.skip(3);
-            let prefix_size  = r.read_u64_le().unwrap_or(0);
+            let prefix_size = r.read_u64_le().unwrap_or(0);
             let message_size = r.read_u64_le().unwrap_or(0);
             lines.push(format!("  dbId:          {}", db_id));
             lines.push(format!("  transactional: {}", transactional));

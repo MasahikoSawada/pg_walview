@@ -11,19 +11,19 @@ pub enum SequenceOp {
 
 impl SequenceOp {
     pub fn from_xl_info(info: u8) -> Self {
-	match info & XLR_RMGR_INFO_MASK {
-	    0x00 => SequenceOp::Log,
-	    _ => SequenceOp::Unknown,
-	}
+        match info & XLR_RMGR_INFO_MASK {
+            0x00 => SequenceOp::Log,
+            _ => SequenceOp::Unknown,
+        }
     }
 }
 
 impl fmt::Display for SequenceOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-	match self {
-	    SequenceOp::Log => write!(f, "LOG"),
-	    SequenceOp::Unknown => write!(f, "Unknown"),
-	}
+        match self {
+            SequenceOp::Log => write!(f, "LOG"),
+            SequenceOp::Unknown => write!(f, "Unknown"),
+        }
     }
 }
 
@@ -35,7 +35,7 @@ pub fn describe_seq_main(info: u8, main: &[u8]) -> Vec<String> {
     match op {
         SequenceOp::Log => {
             let spc = r.read_u32_le().unwrap_or(0);
-            let db  = r.read_u32_le().unwrap_or(0);
+            let db = r.read_u32_le().unwrap_or(0);
             let rel = r.read_u32_le().unwrap_or(0);
             lines.push(format!("  locator:    {}/{}/{}", spc, db, rel));
             lines.push(format!("  tuple data: {} bytes follow", r.remaining()));

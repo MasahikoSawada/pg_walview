@@ -8,6 +8,8 @@ A modernized, interactive TUI alternative to `pg_waldump` for exploring PostgreS
 
 - Visual Transaction Tracking: Visually track `COMMIT`s and `ABORT`s with colored, dynamically drawn graph lines.
 - Deep Drill-down: Detail split view. Inspect `XLogRecord` details, block-level information (`RelFileNode`), and Full Page Images (FPI) instantly.
+- Record checksums are verified (`xl_crc`), and a record that fails is flagged in the list and in the detail pane.
+- The segment a server is currently writing can be opened; reading stops at the point the WAL has been written up to.
 
 ### Build from source
 
@@ -22,7 +24,14 @@ cargo build --release
 PG_INCLUDE_DIR=/path/to/pgsql/include/server cargo build --release
 ```
 
-Note that pg_walview currently supports only PostgreSQL 18.
+pg_walview reads WAL written by the PostgreSQL version whose headers it was
+built against: the WAL page magic and the on-disk struct layouts are taken from
+those headers at build time. Opening a segment from a different major version
+reports the magic number mismatch rather than misreading it. It has been tested
+against PostgreSQL 18 and later.
+
+The WAL page size and segment size are read from the segment's own long page
+header, so a cluster initdb'd with a non-default `--wal-segsize` works.
 
 # Usage
 
@@ -46,6 +55,21 @@ pg_walview /path/to/pg_wal/000000010000000000000001
 | `-` / `PageUp`       | Jump backward (Page Up)             |
 | `Tab`                | Switch Pane                         |
 | `q`                  | Quit the application               |
+
+In the DETAILS pane:
+
+| Key        | Action                                    |
+|------------|-------------------------------------------|
+| `↑` / `↓` | Move the cursor between items              |
+| `Enter`    | Expand / collapse the item under the cursor |
+
+In the HEX DUMP pane:
+
+| Key        | Action                                    |
+|------------|-------------------------------------------|
+| `↑` / `↓` | Scroll one line                            |
+| `Space` / `PageDown` | Scroll down a page               |
+| `b` / `PageUp`       | Scroll up a page                 |
 
 
 # License
